@@ -10,6 +10,12 @@ DEBUG = config('DEBUG', default=False, cast=bool)
 
 ALLOWED_HOSTS = ['*']
 
+CSRF_TRUSTED_ORIGINS = [
+    'https://*.onrender.com',
+    'http://localhost',
+    'http://127.0.0.1',
+]
+
 INSTALLED_APPS = [
     'django.contrib.admin',
     'django.contrib.auth',
@@ -25,10 +31,10 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
-    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
@@ -56,11 +62,9 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'KTP.wsgi.application'
 
+database_url = config('DATABASE_URL', default=f'sqlite:///{BASE_DIR}/db.sqlite3')
 DATABASES = {
-    'default': dj_database_url.config(
-        default=f'sqlite:///{BASE_DIR}/db.sqlite3',
-        conn_max_age=600
-    )
+    'default': dj_database_url.parse(database_url, conn_max_age=600)
 }
 
 AUTH_USER_MODEL = 'users.User'
@@ -82,12 +86,20 @@ SIMPLE_JWT = {
     'REFRESH_TOKEN_LIFETIME': timedelta(days=30),
 }
 
-CACHES = {
-    'default': {
-        'BACKEND': 'django.core.cache.backends.redis.RedisCache',
-        'LOCATION': config('REDIS_URL'),
+redis_url = config('REDIS_URL', default=None)
+if redis_url:
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+            'LOCATION': redis_url,
+        }
     }
-}
+else:
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        }
+    }
 
 CORS_ALLOW_ALL_ORIGINS = True
 
@@ -112,6 +124,8 @@ if not DEBUG:
 
 # Whitenoise middleware already in list — add here if not:
 # 'whitenoise.middleware.WhiteNoiseMiddleware' after SecurityMiddleware
+# Production security
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 
 
