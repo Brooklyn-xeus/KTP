@@ -112,26 +112,31 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
 # Production settings
-if not DEBUG:
-    ALLOWED_HOSTS = ['*']
-    STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
-    STATIC_ROOT = BASE_DIR / 'staticfiles'
-    SECURE_BROWSER_XSS_FILTER = True
-    X_FRAME_OPTIONS = 'DENY'
-    
-    # Whitenoise for static files
-    STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
-    STATIC_ROOT = BASE_DIR / 'staticfiles'
-    
-    # Security
-    SECURE_BROWSER_XSS_FILTER = True
-    X_FRAME_OPTIONS = 'DENY'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+SECURE_BROWSER_XSS_FILTER = True
+X_FRAME_OPTIONS = 'DENY'
+# Production settings
+# STATIC_ROOT = BASE_DIR / 'staticfiles'
+#STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+#SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+#SECURE_BROWSER_XSS_FILTER = True
+#X_FRAME_OPTIONS = 'DENY'
+#    
+#    # Whitenoise for static files
+#    STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
+#    STATIC_ROOT = BASE_DIR / 'staticfiles'
+#    
+#    # Security
+#    SECURE_BROWSER_XSS_FILTER = True
+#    X_FRAME_OPTIONS = 'DENY'
 
 # Whitenoise middleware already in list — add here if not:
 # 'whitenoise.middleware.WhiteNoiseMiddleware' after SecurityMiddleware
 # Production security
-SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 
 
