@@ -12,8 +12,10 @@ ALLOWED_HOSTS = ['*']
 
 CSRF_TRUSTED_ORIGINS = [
     'https://*.onrender.com',
+    'https://ktp-p2zs.onrender.com',
     'http://localhost',
     'http://127.0.0.1',
+    'https://*.onrender.com',
 ]
 
 INSTALLED_APPS = [
