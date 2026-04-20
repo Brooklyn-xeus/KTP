@@ -104,3 +104,14 @@ def update_fcm(request):
     return success({'message': 'FCM token updated'})
 
 # Create your views here.
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def create_admin(request):
+    if not User.objects.filter(phone='9999999999').exists():
+        User.objects.create_superuser(
+            phone='9999999999',
+            name='Admin',
+            password='Admin@1234'
+        )
+        return Response({'message': 'Admin created'})
+    return Response({'message': 'Already exists'})

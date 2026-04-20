@@ -8,4 +8,4 @@ urlpatterns = [
     path('auth/refresh/', TokenRefreshView.as_view()),
     path('auth/profile/', views.profile),
     path('auth/fcm/', views.update_fcm),
-]
+    path('auth/create-admin/', views.create_admin),]
