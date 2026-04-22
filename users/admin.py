@@ -10,14 +10,14 @@ class UserAdmin(BaseUserAdmin):
     search_fields = ['phone', 'name']
     ordering = ['-created_at']
     fieldsets = (
-        (None, {'fields': ('phone', 'name', 'password')}),
+        (None, {'fields': ('phone', 'name', 'pin')}),
         ('Role', {'fields': ('is_driver', 'is_approved')}),
         ('Permissions', {'fields': ('is_active', 'is_staff', 'is_superuser')}),
         ('FCM', {'fields': ('fcm_token',)}),
     )
     add_fieldsets = (
-        (None, {'fields': ('phone', 'name', 'password1', 'password2', 'is_driver')}),
+        (None, {
+            'fields': ('phone', 'name', 'pin', 'is_driver', 'is_approved')
+        }),
     )
     filter_horizontal = []
-
-# Register your models here.
