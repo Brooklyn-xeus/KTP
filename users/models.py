@@ -1,5 +1,8 @@
+# Create your models here
+
 from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
 from django.db import models
+import random
 
 class UserManager(BaseUserManager):
     def create_user(self, phone, name, password=None, **extra_fields):
@@ -27,14 +30,22 @@ class User(AbstractBaseUser, PermissionsMixin):
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
     fcm_token = models.TextField(blank=True, null=True)
+    pin = models.CharField(max_length=4, blank=True, null=True)
+    otp = models.CharField(max_length=6, blank=True, null=True)
+    otp_expires = models.DateTimeField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     USERNAME_FIELD = 'phone'
     REQUIRED_FIELDS = ['name']
     objects = UserManager()
 
+    def generate_otp(self):
+        self.otp = str(random.randint(100000, 999999))
+        from django.utils import timezone
+        self.otp_expires = timezone.now() + timezone.timedelta(minutes=10)
+        self.save()
+        return self.otp
+
     def __str__(self):
         role = 'Driver' if self.is_driver else 'Passenger'
         return f"{self.name} ({role}) — {self.phone}"
-
-# Create your models here.
