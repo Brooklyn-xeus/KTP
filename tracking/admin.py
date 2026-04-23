@@ -1,24 +1,29 @@
 from django.contrib import admin
-from .models import BusLocation, PassengerWaiting, Subscription, NotificationLog
+from .models import (BusLocation, PassengerWaiting, Subscription,
+                     NotificationLog, Trip, LocationSharingSession,
+                     DriverFrequentRoute)
+
+@admin.register(Trip)
+class TripAdmin(admin.ModelAdmin):
+    list_display = ['id', 'driver', 'bus', 'route', 'status', 'start_time']
+    list_filter = ['status']
 
 @admin.register(BusLocation)
 class BusLocationAdmin(admin.ModelAdmin):
-    list_display = ['bus', 'lat', 'lng', 'last_updated']
+    list_display = ['bus', 'lat', 'lng', 'speed', 'last_updated']
     readonly_fields = ['last_updated']
 
 @admin.register(PassengerWaiting)
 class PassengerWaitingAdmin(admin.ModelAdmin):
     list_display = ['user', 'route', 'got_bus', 'created_at']
-    list_filter = ['got_bus']
 
 @admin.register(Subscription)
 class SubscriptionAdmin(admin.ModelAdmin):
     list_display = ['user', 'route', 'time_window', 'is_active']
-    list_filter = ['time_window', 'is_active']
 
-@admin.register(NotificationLog)
-class NotificationLogAdmin(admin.ModelAdmin):
-    list_display = ['user', 'route', 'bus', 'time_window', 'sent_at']
-    list_filter = ['time_window']
+@admin.register(LocationSharingSession)
+class LocationSharingSessionAdmin(admin.ModelAdmin):
+    list_display = ['user', 'from_stop', 'to_stop', 'is_active', 'created_at']
 
-# Register your models here.
+admin.site.register(NotificationLog)
+admin.site.register(DriverFrequentRoute)
