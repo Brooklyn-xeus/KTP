@@ -120,6 +120,12 @@ def end_trip(request):
 @permission_classes([AllowAny])
 def get_buses(request):
     now = timezone.now()
+    
+    # Optional location filter
+    lat = request.query_params.get('lat')
+    lng = request.query_params.get('lng')
+    radius_m = float(request.query_params.get('radius_m', 5000))
+    
     active_buses = Bus.objects.filter(
         is_active=True,
         location__isnull=False
@@ -128,17 +134,40 @@ def get_buses(request):
     result = []
     for bus in active_buses:
         loc = bus.location
-
-        # Auto disable if >10 min
         diff = (now - loc.last_updated).total_seconds()
+        
         if diff > 600:
             bus.is_active = False
             bus.save()
             continue
 
-        # Skip stale >60 sec
         if diff > 60:
             continue
+
+        # Distance filter agar lat/lng diya hai
+        if lat and lng:
+            try:
+                user_lat = float(lat)
+                user_lng = float(lng)
+                bus_lat = loc.lat
+                bus_lng = loc.lng
+                
+                # Simple distance calculation (meters)
+                import math
+                R = 6371000
+                dlat = math.radians(bus_lat - user_lat)
+                dlng = math.radians(bus_lng - user_lng)
+                a = (math.sin(dlat/2)**2 + 
+                     math.cos(math.radians(user_lat)) * 
+                     math.cos(math.radians(bus_lat)) * 
+                     math.sin(dlng/2)**2)
+                distance = R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+                
+                if distance > radius_m:
+                    continue
+                    
+            except (ValueError, TypeError):
+                pass
 
         result.append({
             'bus_id': bus.id,
