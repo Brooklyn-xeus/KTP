@@ -161,6 +161,13 @@ def driver_verify_otp(request):
     return success({
         'message': 'Phone verified. Wait for admin approval.',
         'is_approved': user.is_approved,
+        'user': {
+            'phone': user.phone,
+            'name': user.name,
+            'is_driver': True,
+            'is_approved': user.is_approved,
+        },
+        'tokens': get_tokens(user)
     })
 
 @api_view(['POST'])
