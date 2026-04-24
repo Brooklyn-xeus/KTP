@@ -1,3 +1,4 @@
+from .models import UserRoutePreference, StaleTrip
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
@@ -622,4 +623,227 @@ def trip_summary(request):
         'end_time': trip.end_time.isoformat() if trip.end_time else None,
         'duration_minutes': duration,
         'passenger_count': trip.passenger_count,
+    })
+# ─── PHASE 2 — USER PREFERENCES ───────────────────────────
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def save_route_preference(request):
+    from_stop_id = request.data.get('from_stop_id')
+    to_stop_id = request.data.get('to_stop_id')
+
+    if not from_stop_id or not to_stop_id:
+        return error('from_stop_id and to_stop_id required')
+
+    try:
+        from_stop = Stop.objects.get(id=from_stop_id)
+        to_stop = Stop.objects.get(id=to_stop_id)
+    except Stop.DoesNotExist:
+        return error('Stop not found', 404)
+
+    pref, _ = UserRoutePreference.objects.update_or_create(
+        user=request.user,
+        defaults={'from_stop': from_stop, 'to_stop': to_stop}
+    )
+
+    return success({
+        'message': 'Preference saved',
+        'from_stop': from_stop.name,
+        'to_stop': to_stop.name,
+    })
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_route_preference(request):
+    try:
+        pref = request.user.route_preference
+        return success({
+            'from_stop': {'id': pref.from_stop.id, 'name': pref.from_stop.name},
+            'to_stop': {'id': pref.to_stop.id, 'name': pref.to_stop.name},
+        })
+    except UserRoutePreference.DoesNotExist:
+        return success({'from_stop': None, 'to_stop': None})
+
+# ─── PHASE 2 — STALE TRIP DETECTION ───────────────────────
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def force_refresh(request):
+    trip_id = request.data.get('trip_id')
+    try:
+        trip = Trip.objects.get(id=trip_id, driver=request.user)
+        return success({'message': 'Ping received', 'trip_id': trip.id})
+    except Trip.DoesNotExist:
+        return error('Trip not found', 404)
+
+def check_stale_trips():
+    now = timezone.now()
+    active_trips = Trip.objects.filter(status='active')
+    for trip in active_trips:
+        try:
+            loc = trip.bus.location
+            diff = (now - loc.last_updated).total_seconds()
+            if diff > 30:
+                trip.status = 'stale'
+                trip.save()
+                trip.bus.is_active = False
+                trip.bus.save()
+        except BusLocation.DoesNotExist:
+            pass
+
+# ─── PHASE 2 — SUBSCRIBE WITH DAILY TIME ──────────────────
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def subscribe_with_time(request):
+    route_id = request.data.get('route_id')
+    from_stop_id = request.data.get('from_stop_id')
+    to_stop_id = request.data.get('to_stop_id')
+    daily_time = request.data.get('daily_time')
+    time_window = request.data.get('time_window', 'AM').upper()
+
+    if not route_id or not daily_time:
+        return error('route_id and daily_time required')
+
+    try:
+        from datetime import datetime
+        time_obj = datetime.strptime(daily_time, '%H:%M').time()
+    except ValueError:
+        return error('daily_time format must be HH:MM')
+
+    try:
+        route = Route.objects.get(id=route_id)
+    except Route.DoesNotExist:
+        return error('Route not found', 404)
+
+    sub, created = Subscription.objects.update_or_create(
+        user=request.user,
+        route=route,
+        time_window=time_window,
+        defaults={
+            'from_stop_id': from_stop_id,
+            'to_stop_id': to_stop_id,
+            'daily_time': time_obj,
+            'is_active': True,
+        }
+    )
+
+    return success({
+        'message': f'Subscribed to {route.name} at {daily_time}',
+        'id': sub.id,
+        'daily_time': daily_time,
+    })
+
+# ─── PHASE 3 — NOTIFICATION TRIGGER ──────────────────────
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def trigger_notifications(request):
+    bus_id = request.data.get('bus_id')
+    if not bus_id:
+        return error('bus_id required')
+
+    try:
+        bus = Bus.objects.select_related('route').get(id=bus_id)
+    except Bus.DoesNotExist:
+        return error('Bus not found', 404)
+
+    from .firebase import send_bulk_notification
+    now = timezone.now()
+    hour = now.hour
+    current_window = 'AM' if 5 <= hour <= 12 else 'PM'
+
+    subs = Subscription.objects.filter(
+        route=bus.route,
+        time_window=current_window,
+        is_active=True,
+        user__fcm_token__isnull=False
+    ).exclude(
+        user__in=NotificationLog.objects.filter(
+            route=bus.route,
+            bus=bus,
+            time_window=current_window,
+            sent_at__date=now.date()
+        ).values('user')
+    ).select_related('user')
+
+    tokens = []
+    notified = []
+
+    for sub in subs:
+        if sub.user.fcm_token:
+            tokens.append(sub.user.fcm_token)
+            notified.append(sub)
+
+    if tokens:
+        send_bulk_notification(
+            tokens=tokens,
+            title=f'🚌 Bus Coming — {bus.route.name}',
+            body='Your bus is on the way! Open KTP to track.',
+            data={'bus_id': str(bus.id), 'route_id': str(bus.route.id)}
+        )
+        for sub in notified:
+            NotificationLog.objects.get_or_create(
+                user=sub.user,
+                route=bus.route,
+                bus=bus,
+                time_window=current_window,
+            )
+
+    return success({'message': f'Notified {len(tokens)} users'})
+
+# ─── PHASE 3 — DRIVER VERIFIED BADGE ─────────────────────
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def driver_badge(request):
+    user = request.user
+    if not user.is_driver:
+        return error('Not a driver')
+    return success({
+        'is_verified': user.is_approved,
+        'badge': 'verified' if user.is_approved else 'pending',
+        'badge_color': '#2196F3' if user.is_approved else '#9E9E9E',
+    })
+
+# ─── PHASE 3 — TRIP COMPRESSED SUMMARY ───────────────────
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def trip_history(request):
+    trips = Trip.objects.filter(
+        driver=request.user,
+        status='completed'
+    ).order_by('-start_time')[:10]
+
+    return success({
+        'trips': [{
+            'trip_id': t.id,
+            'route': t.route.name,
+            'date': t.start_time.strftime('%Y-%m-%d'),
+            'duration_minutes': round(
+                (t.end_time - t.start_time).total_seconds() / 60
+            ) if t.end_time else None,
+            'passenger_count': t.passenger_count,
+        } for t in trips]
+    })
+
+# ─── PHASE 3 — ADMIN STATS ────────────────────────────────
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def admin_stats(request):
+    if not request.user.is_staff:
+        return error('Admin only', 403)
+
+    from users.models import User
+    return success({
+        'total_users': User.objects.count(),
+        'total_drivers': User.objects.filter(is_driver=True).count(),
+        'approved_drivers': User.objects.filter(is_driver=True, is_approved=True).count(),
+        'active_buses': Bus.objects.filter(is_active=True).count(),
+        'total_trips_today': Trip.objects.filter(
+            start_time__date=timezone.now().date()
+        ).count(),
+        'active_sharing_sessions': LocationSharingSession.objects.filter(is_active=True).count(),
     })

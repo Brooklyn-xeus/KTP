@@ -1,4 +1,5 @@
 from django.contrib import admin
+from .models import UserRoutePreference, StaleTrip
 from .models import (BusLocation, PassengerWaiting, Subscription,
                      NotificationLog, Trip, LocationSharingSession,
                      DriverFrequentRoute)
@@ -27,3 +28,8 @@ class LocationSharingSessionAdmin(admin.ModelAdmin):
 
 admin.site.register(NotificationLog)
 admin.site.register(DriverFrequentRoute)
+@admin.register(UserRoutePreference)
+class UserRoutePrefAdmin(admin.ModelAdmin):
+    list_display = ['user', 'from_stop', 'to_stop', 'updated_at']
+
+admin.site.register(StaleTrip)

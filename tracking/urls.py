@@ -33,4 +33,15 @@ urlpatterns = [
     path('driver/end-trip/', views.end_trip),
     path('driver/passengers/', views.get_trip_passengers),
     path('driver/trip-summary/', views.trip_summary),
+    # Phase 2
+path('user/preferences/route/', views.save_route_preference),
+path('user/preferences/route/get/', views.get_route_preference),
+path('subscribe/timed/', views.subscribe_with_time),
+path('driver/location/refresh/', views.force_refresh),
+
+# Phase 3
+path('notify/trigger/', views.trigger_notifications),
+path('driver/badge/', views.driver_badge),
+path('driver/trip-history/', views.trip_history),
+path('admin/stats/', views.admin_stats),
 ]

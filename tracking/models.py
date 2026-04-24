@@ -99,3 +99,18 @@ class DriverFrequentRoute(models.Model):
     class Meta:
         unique_together = ['driver', 'route']
         ordering = ['-usage_count']
+class UserRoutePreference(models.Model):
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='route_preference')
+    from_stop = models.ForeignKey(Stop, on_delete=models.CASCADE, related_name='pref_from')
+    to_stop = models.ForeignKey(Stop, on_delete=models.CASCADE, related_name='pref_to')
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.user.name}: {self.from_stop} → {self.to_stop}"
+
+class StaleTrip(models.Model):
+    trip = models.OneToOneField(Trip, on_delete=models.CASCADE)
+    marked_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"Stale: {self.trip}"
