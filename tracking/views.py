@@ -6,6 +6,9 @@ from django.core.cache import cache
 from django.utils import timezone
 from django.db.models import Q
 import math
+from .models import EmergencyAlert, PassengerCountLog, StopArrival
+from django.utils import timezone
+from django.core.cache import cache
 from .models import (BusLocation, PassengerWaiting, Subscription,
                      NotificationLog, Trip, LocationSharingSession,
                      DriverFrequentRoute)
@@ -847,3 +850,293 @@ def admin_stats(request):
         ).count(),
         'active_sharing_sessions': LocationSharingSession.objects.filter(is_active=True).count(),
     })
+# ─── EMERGENCY ALERT ───────────────────────────────────────
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def emergency_alert(request):
+    user = request.user
+
+    if not user.is_driver:
+        return error('Not a driver')
+
+    # Rate limit — 1 emergency per 5 minutes
+    cache_key = f'emergency_{user.id}'
+    if cache.get(cache_key):
+        return error('Emergency already sent. Wait 5 minutes.', 429)
+
+    trip_id = request.data.get('trip_id')
+
+    if trip_id:
+        try:
+            trip = Trip.objects.get(id=trip_id, driver=user, status__in=['active', 'paused'])
+        except Trip.DoesNotExist:
+            return error('Active trip not found', 404)
+    else:
+        trip = Trip.objects.filter(driver=user, status__in=['active', 'paused']).first()
+        if not trip:
+            return error('No active trip found', 404)
+
+    try:
+        loc = trip.bus.location
+        lat = loc.lat
+        lng = loc.lng
+    except BusLocation.DoesNotExist:
+        lat = 0.0
+        lng = 0.0
+
+    alert = EmergencyAlert.objects.create(
+        driver=user,
+        trip=trip,
+        latitude=lat,
+        longitude=lng,
+    )
+
+    # Rate limit set karo
+    cache.set(cache_key, True, timeout=300)
+
+    # Admin ko notify karo
+    print(f"🚨 EMERGENCY ALERT — Driver: {user.name} | Trip: {trip.id} | Location: {lat},{lng}")
+
+    # FCM notification to admins
+    from users.models import User as UserModel
+    admin_tokens = list(
+        UserModel.objects.filter(
+            is_staff=True,
+            fcm_token__isnull=False
+        ).values_list('fcm_token', flat=True)
+    )
+
+    if admin_tokens:
+        try:
+            from .firebase import send_bulk_notification
+            send_bulk_notification(
+                tokens=admin_tokens,
+                title='🚨 Emergency Alert!',
+                body=f'Driver {user.name} needs help! Trip #{trip.id}',
+                data={
+                    'alert_id': str(alert.id),
+                    'driver': user.name,
+                    'lat': str(lat),
+                    'lng': str(lng),
+                    'type': 'emergency',
+                }
+            )
+        except Exception as e:
+            print(f"FCM Error: {e}")
+
+    return success({
+        'alert_id': alert.id,
+        'message': 'Emergency alert sent',
+        'location': {'lat': lat, 'lng': lng},
+    })
+
+# ─── PASSENGER COUNT UPDATE ────────────────────────────────
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def update_passenger_count(request):
+    user = request.user
+
+    if not user.is_driver:
+        return error('Not a driver')
+
+    trip_id = request.data.get('trip_id')
+    count = request.data.get('count')
+
+    if count is None:
+        return error('count required')
+
+    try:
+        count = int(count)
+        if count < 0:
+            return error('count cannot be negative')
+    except (ValueError, TypeError):
+        return error('count must be a number')
+
+    try:
+        trip = Trip.objects.get(id=trip_id, driver=user, status__in=['active', 'paused'])
+    except Trip.DoesNotExist:
+        return error('Active trip not found', 404)
+
+    trip.passenger_count = count
+    trip.save()
+
+    # Log karo for analytics
+    PassengerCountLog.objects.create(trip=trip, count=count)
+
+    return success({
+        'count': count,
+        'trip_id': trip.id,
+        'message': 'Passenger count updated',
+    })
+
+# ─── ARRIVAL CONFIRMATION ──────────────────────────────────
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def confirm_arrival(request):
+    user = request.user
+
+    if not user.is_driver:
+        return error('Not a driver')
+
+    trip_id = request.data.get('trip_id')
+    stop_id = request.data.get('stop_id')
+
+    if not trip_id or not stop_id:
+        return error('trip_id and stop_id required')
+
+    try:
+        trip = Trip.objects.select_related('route').get(
+            id=trip_id, driver=user, status__in=['active', 'paused']
+        )
+    except Trip.DoesNotExist:
+        return error('Active trip not found', 404)
+
+    try:
+        stop = Stop.objects.get(id=stop_id)
+    except Stop.DoesNotExist:
+        return error('Stop not found', 404)
+
+    # Stop belongs to route check
+    if not RouteStop.objects.filter(route=trip.route, stop=stop).exists():
+        return error('Stop not on this route', 400)
+
+    # Arrival mark karo
+    arrival, created = StopArrival.objects.get_or_create(trip=trip, stop=stop)
+
+    if not created:
+        return error('Already confirmed arrival at this stop', 400)
+
+    # Next stops calculate karo
+    current_order = RouteStop.objects.get(route=trip.route, stop=stop).order
+    next_route_stops = RouteStop.objects.filter(
+        route=trip.route,
+        order__gt=current_order
+    ).select_related('stop').order_by('order')[:3]
+
+    next_stops = []
+    for rs in next_route_stops:
+        eta = None
+        try:
+            loc = trip.bus.location
+            eta = estimate_eta(loc.lat, loc.lng, rs.stop.lat, rs.stop.lng)
+        except Exception:
+            pass
+
+        next_stops.append({
+            'stop_id': rs.stop.id,
+            'name': rs.stop.name,
+            'lat': rs.stop.lat,
+            'lng': rs.stop.lng,
+            'order': rs.order,
+            'eta_minutes': eta,
+        })
+
+    # Notify subscribers at this stop
+    subs = Subscription.objects.filter(
+        from_stop=stop,
+        is_active=True,
+        user__fcm_token__isnull=False
+    ).select_related('user')
+
+    tokens = [s.user.fcm_token for s in subs if s.user.fcm_token]
+    if tokens:
+        try:
+            from .firebase import send_bulk_notification
+            send_bulk_notification(
+                tokens=tokens,
+                title=f'🚌 Bus arriving at {stop.name}',
+                body=f'Your bus on {trip.route.name} is here!',
+                data={'stop_id': str(stop.id), 'trip_id': str(trip.id)}
+            )
+        except Exception as e:
+            print(f"FCM Error: {e}")
+
+    return success({
+        'message': f'Arrival confirmed at {stop.name}',
+        'stop': {'id': stop.id, 'name': stop.name},
+        'next_stops': next_stops,
+    })
+
+# ─── NEXT STOPS FOR TRIP ───────────────────────────────────
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def next_stops(request):
+    user = request.user
+
+    if not user.is_driver:
+        return error('Not a driver')
+
+    trip_id = request.query_params.get('trip_id')
+
+    try:
+        trip = Trip.objects.select_related('route').get(
+            id=trip_id, driver=user
+        )
+    except Trip.DoesNotExist:
+        return error('Trip not found', 404)
+
+    route_stops = RouteStop.objects.filter(
+        route=trip.route
+    ).select_related('stop').order_by('order')
+
+    arrived_stops = set(
+        StopArrival.objects.filter(trip=trip).values_list('stop_id', flat=True)
+    )
+
+    last_arrived_order = 0
+    for rs in route_stops:
+        if rs.stop.id in arrived_stops:
+            last_arrived_order = rs.order
+
+    result = []
+    for rs in route_stops:
+        if rs.stop.id in arrived_stops:
+            status = 'arrived'
+        elif rs.order == last_arrived_order + 1:
+            status = 'current'
+        elif rs.order > last_arrived_order:
+            status = 'upcoming'
+        else:
+            status = 'arrived'
+
+        eta = None
+        if status in ['current', 'upcoming']:
+            try:
+                loc = trip.bus.location
+                eta = estimate_eta(loc.lat, loc.lng, rs.stop.lat, rs.stop.lng)
+            except Exception:
+                pass
+
+        result.append({
+            'stop_id': rs.stop.id,
+            'name': rs.stop.name,
+            'lat': rs.stop.lat,
+            'lng': rs.stop.lng,
+            'order': rs.order,
+            'status': status,
+            'eta_minutes': eta,
+        })
+
+    return success({'stops': result})
+
+# ─── RESOLVE EMERGENCY ─────────────────────────────────────
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def resolve_emergency(request):
+    if not request.user.is_staff:
+        return error('Admin only', 403)
+
+    alert_id = request.data.get('alert_id')
+    try:
+        alert = EmergencyAlert.objects.get(id=alert_id)
+        alert.resolved = True
+        alert.notes = request.data.get('notes', '')
+        alert.save()
+        return success({'message': 'Emergency resolved'})
+    except EmergencyAlert.DoesNotExist:
+        return error('Alert not found', 404)

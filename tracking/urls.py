@@ -44,4 +44,14 @@ path('notify/trigger/', views.trigger_notifications),
 path('driver/badge/', views.driver_badge),
 path('driver/trip-history/', views.trip_history),
 path('admin/stats/', views.admin_stats),
+# Emergency
+path('driver/emergency/', views.emergency_alert),
+path('driver/emergency/resolve/', views.resolve_emergency),
+
+# Passenger Count
+path('driver/passenger-count/', views.update_passenger_count),
+
+# Arrival
+path('driver/arrival/', views.confirm_arrival),
+path('driver/trip/next-stops/', views.next_stops),
 ]

@@ -114,3 +114,33 @@ class StaleTrip(models.Model):
 
     def __str__(self):
         return f"Stale: {self.trip}"
+class EmergencyAlert(models.Model):
+    driver = models.ForeignKey(User, on_delete=models.CASCADE, related_name='emergencies')
+    trip = models.ForeignKey(Trip, on_delete=models.CASCADE)
+    latitude = models.FloatField()
+    longitude = models.FloatField()
+    timestamp = models.DateTimeField(auto_now_add=True)
+    resolved = models.BooleanField(default=False)
+    notes = models.TextField(blank=True, null=True)
+
+    def __str__(self):
+        return f"Emergency — {self.driver.name} @ {self.timestamp}"
+
+class PassengerCountLog(models.Model):
+    trip = models.ForeignKey(Trip, on_delete=models.CASCADE, related_name='count_logs')
+    count = models.IntegerField()
+    logged_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"Trip {self.trip.id} — {self.count} passengers"
+
+class StopArrival(models.Model):
+    trip = models.ForeignKey(Trip, on_delete=models.CASCADE, related_name='arrivals')
+    stop = models.ForeignKey(Stop, on_delete=models.CASCADE)
+    arrival_time = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('trip', 'stop')
+
+    def __str__(self):
+        return f"Trip {self.trip.id} arrived at {self.stop.name}"
