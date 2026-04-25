@@ -140,7 +140,7 @@ def get_bus_detail(request, bus_id):
         'lat': loc.lat,
         'lng': loc.lng,
         'last_updated': loc.last_updated.isoformat(),
-    })l
+    })
     
 @api_view(['POST'])
 @permission_classes([AllowAny])
