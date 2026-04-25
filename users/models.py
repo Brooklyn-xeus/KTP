@@ -34,7 +34,8 @@ class User(AbstractBaseUser, PermissionsMixin):
     otp = models.CharField(max_length=6, blank=True, null=True)
     otp_expires = models.DateTimeField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
-
+    license_no = models.CharField(max_length=50, blank=True, null=True)
+    bus_number = models.CharField(max_length=20, blank=True, null=True)
     USERNAME_FIELD = 'phone'
     REQUIRED_FIELDS = ['name']
     objects = UserManager()

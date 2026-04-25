@@ -109,12 +109,20 @@ def driver_register(request):
     phone = request.data.get('phone', '').strip()
     name = request.data.get('name', '').strip()
     pin = request.data.get('pin', '').strip()
+    license_no = request.data.get('license_no', '').strip()
+    bus_number = request.data.get('bus_number', '').strip()
 
     if not phone or not name:
         return error('Phone and name required')
 
     if len(pin) != 4 or not pin.isdigit():
         return error('PIN must be 4 digits')
+
+    if not license_no:
+        return error('License number required')
+
+    if not bus_number:
+        return error('Bus number required')
 
     if User.objects.filter(phone=phone).exists():
         return error('User already exists')
@@ -126,14 +134,15 @@ def driver_register(request):
         is_approved=False
     )
     user.pin = pin
+    user.license_no = license_no
+    user.bus_number = bus_number
     user.save()
 
-    # Send OTP for driver verification
     otp = user.generate_otp()
     send_otp_sms(phone, otp)
 
     return success({
-        'message': 'OTP sent for verification',
+        'message': 'Registration successful. OTP sent for verification.',
         'phone': phone,
     })
 
