@@ -394,27 +394,64 @@ def unsubscribe_route(request, sub_id):
         return error('Subscription not found', 404)
 
 # ─── DRIVER APIs ───────────────────────────────────────────
-
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def driver_profile(request):
     user = request.user
+
     if not user.is_driver:
         return error('Not a driver')
 
+    # Bus dhundho — user.bus se ya bus_number se
+    bus = None
     try:
         bus = user.bus
-        active_trip = Trip.objects.filter(driver=user, status='active').first()
-        return success({
-            'name': user.name,
-            'phone': user.phone,
-            'bus_number': bus.plate_number,
-            'is_verified': user.is_approved,
-            'trip_status': active_trip.status if active_trip else 'inactive',
-            'trip_id': active_trip.id if active_trip else None,
-        })
-    except Bus.DoesNotExist:
-        return error('No bus assigned')
+    except Exception:
+        pass
+
+    # Agar user.bus nahi mila toh bus_number se dhundho
+    if not bus and user.bus_number:
+        from buses.models import Bus as BusModel
+        try:
+            bus = BusModel.objects.get(plate_number=user.bus_number)
+            # Assign kar do
+            bus.driver = user
+            bus.save()
+        except BusModel.DoesNotExist:
+            # Bus exist nahi karta — banao
+            from buses.models import Route
+            route = Route.objects.first()
+            if route:
+                bus = BusModel.objects.create(
+                    plate_number=user.bus_number,
+                    route=route,
+                    driver=user,
+                    is_active=False,
+                )
+
+    if not bus:
+        return error('No bus assigned. Contact admin.')
+
+    active_trip = Trip.objects.filter(
+        driver=user, status__in=['active', 'paused']
+    ).first()
+
+    return success({
+        'name': user.name,
+        'phone': user.phone,
+        'bus_number': bus.plate_number,
+        'license_no': user.license_no,
+        'is_approved': user.is_approved,
+        'is_verified': user.is_approved,
+        'trip_status': active_trip.status if active_trip else 'inactive',
+        'trip_id': active_trip.id if active_trip else None,
+        'route': {
+            'id': bus.route.id,
+            'name': bus.route.name,
+            'start': bus.route.start_point,
+            'end': bus.route.end_point,
+        }
+    })
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
