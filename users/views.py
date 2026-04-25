@@ -163,18 +163,40 @@ def driver_verify_otp(request):
     if timezone.now() > user.otp_expires:
         return error('OTP expired')
 
+    # OTP verified — auto approve karo
     user.otp = None
     user.otp_expires = None
+    user.is_approved = True  # ← AUTO APPROVE
     user.save()
 
+    # Auto create bus
+    from buses.models import Bus, Route
+    try:
+        route = Route.objects.first()
+        if route and user.bus_number:
+            bus, created = Bus.objects.get_or_create(
+                plate_number=user.bus_number,
+                defaults={
+                    'route': route,
+                    'driver': user,
+                    'is_active': False,
+                }
+            )
+            if not created and bus.driver is None:
+                bus.driver = user
+                bus.save()
+    except Exception as e:
+        print(f"Bus creation error: {e}")
+
     return success({
-        'message': 'Phone verified. Wait for admin approval.',
-        'is_approved': user.is_approved,
+        'message': 'Phone verified. You can start driving!',
+        'is_approved': True,
+        'is_verified': False,  # Admin blue tick baad mein
         'user': {
             'phone': user.phone,
             'name': user.name,
             'is_driver': True,
-            'is_approved': user.is_approved,
+            'is_approved': True,
         },
         'tokens': get_tokens(user)
     })

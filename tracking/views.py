@@ -74,18 +74,19 @@ def get_buses(request):
     for bus in buses:
         loc = bus.location
         bus_data = {
-            'bus_id': bus.id,
-            'plate': bus.plate_number,
-            'route': bus.route.name,
-            'route_id': bus.route.id,
-            'start': bus.route.start_point,
-            'end': bus.route.end_point,
-            'lat': loc.lat,
-            'lng': loc.lng,
-            'driver_name': bus.driver.name if bus.driver else 'Unknown',
-            'is_paused': False,
-            'last_updated': loc.last_updated.isoformat(),
-        }
+    'bus_id': bus.id,
+    'plate': bus.plate_number,
+    'route': bus.route.name,
+    'route_id': bus.route.id,
+    'start': bus.route.start_point,
+    'end': bus.route.end_point,
+    'lat': loc.lat,
+    'lng': loc.lng,
+    'driver_name': bus.driver.name if bus.driver else 'Unknown',
+    'is_verified': bus.driver.is_approved if bus.driver else False,  # ← Blue tick
+    'is_paused': False,
+    'last_updated': loc.last_updated.isoformat(),
+}
 
         if lat and lng:
             try:
@@ -139,7 +140,7 @@ def get_bus_detail(request, bus_id):
         'lat': loc.lat,
         'lng': loc.lng,
         'last_updated': loc.last_updated.isoformat(),
-    })
+    })l
     
 @api_view(['POST'])
 @permission_classes([AllowAny])
@@ -427,14 +428,21 @@ def driver_routes(request):
         frequent = DriverFrequentRoute.objects.filter(driver=user).values_list('route_id', flat=True)
         route = bus.route
         return success({
-            'routes': [{
-                'id': route.id,
-                'name': route.name,
-                'start': route.start_point,
-                'end': route.end_point,
-                'is_frequent': route.id in frequent,
-            }]
-        })
+    'name': user.name,
+    'phone': user.phone,
+    'bus_number': bus.plate_number,
+    'license_no': user.license_no,
+    'is_approved': user.is_approved,
+    'is_verified': user.is_approved,  # Blue tick
+    'trip_status': active_trip.status if active_trip else 'inactive',
+    'trip_id': active_trip.id if active_trip else None,
+    'route': {
+        'id': bus.route.id,
+        'name': bus.route.name,
+        'start': bus.route.start_point,
+        'end': bus.route.end_point,
+    }
+})
     except Bus.DoesNotExist:
         return error('No bus assigned')
 
