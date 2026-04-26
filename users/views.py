@@ -3,7 +3,9 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.utils import timezone
+from django.core.cache import cache
 from .models import User
+import requests as http_requests
 
 def get_tokens(user):
     refresh = RefreshToken.for_user(user)
@@ -22,86 +24,99 @@ def error(msg, status=400):
     return Response({'success': False, 'message': msg}, status=status)
 
 def send_otp_sms(phone, otp):
-    # Firebase SMS ya simple print for now
-    print(f"OTP for {phone}: {otp}")
+    from decouple import config
+    api_key = config('FAST2SMS_API_KEY', default=None)
+    if not api_key:
+        print(f"OTP for {phone}: {otp}")
+        return True
+    try:
+        response = http_requests.post(
+            "https://www.fast2sms.com/dev/bulkV2",
+            json={
+                "route": "otp",
+                "variables_values": otp,
+                "flash": 0,
+                "numbers": phone,
+            },
+            headers={"authorization": api_key}
+        )
+        return response.json().get('return', False)
+    except Exception as e:
+        print(f"SMS Error: {e}")
+        return False
+
+def check_rate_limit(key, max_attempts=5, window=600):
+    attempts = cache.get(key, 0)
+    if attempts >= max_attempts:
+        return False
+    cache.set(key, attempts + 1, timeout=window)
     return True
 
-# ─── PASSENGER AUTH ────────────────────────────────────────
+# ─── PASSENGER — GOOGLE AUTH ──────────────────────────────
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
-def register(request):
-    phone = request.data.get('phone', '').strip()
-    name = request.data.get('name', '').strip()
-    pin = request.data.get('pin', '').strip()
-    is_driver = request.data.get('is_driver', False)
+def google_login(request):
+    id_token = request.data.get('id_token')
+    device_fingerprint = request.data.get('device_fingerprint', '')
 
-    if not phone or not name:
-        return error('Phone and name required')
+    if not id_token:
+        return error('id_token required')
 
-    if len(pin) != 4 or not pin.isdigit():
-        return error('PIN must be 4 digits')
+    # Rate limit by device
+    if device_fingerprint:
+        rate_key = f'google_login_{device_fingerprint}'
+        if not check_rate_limit(rate_key, max_attempts=10, window=3600):
+            return error('Too many attempts. Try later.', 429)
 
-    if User.objects.filter(phone=phone).exists():
-        return error('User already exists')
-
-    user = User.objects.create_user(
-        phone=phone,
-        name=name,
-        is_driver=is_driver
-    )
-    user.pin = pin
-    user.save()
-
-    return success({
-        'message': 'Registered successfully',
-        'user': {
-            'phone': user.phone,
-            'name': user.name,
-            'is_driver': user.is_driver,
-        },
-        'tokens': get_tokens(user)
-    })
-
-@api_view(['POST'])
-@permission_classes([AllowAny])
-def login_passenger(request):
-    phone = request.data.get('phone', '').strip()
-    pin = request.data.get('pin', '').strip()
-
-    if not phone or not pin:
-        return error('Phone and PIN required')
-
+    # Verify Google token
     try:
-        user = User.objects.get(phone=phone)
-    except User.DoesNotExist:
-        return error('User not found', 404)
+        google_response = http_requests.get(
+            f'https://oauth2.googleapis.com/tokeninfo?id_token={id_token}'
+        )
+        google_data = google_response.json()
 
-    if user.is_driver:
-        return error('Drivers use driver login')
+        if 'error' in google_data:
+            return error('Invalid Google token')
 
-    if user.pin != pin:
-        return error('Wrong PIN')
+        google_id = google_data.get('sub')
+        email = google_data.get('email')
+        name = google_data.get('name', email.split('@')[0] if email else 'User')
 
-    if not user.is_active:
-        return error('Account disabled')
+        if not google_id:
+            return error('Invalid Google token')
 
-    fcm_token = request.data.get('fcm_token')
-    if fcm_token:
-        user.fcm_token = fcm_token
+    except Exception as e:
+        return error(f'Token verification failed: {str(e)}')
+
+    # Get or create user
+    user, created = User.objects.get_or_create(
+        google_id=google_id,
+        defaults={
+            'name': name,
+            'email': email,
+            'is_driver': False,
+            'is_approved': True,
+            'device_fingerprint': device_fingerprint,
+        }
+    )
+
+    if not created and device_fingerprint:
+        user.device_fingerprint = device_fingerprint
         user.save()
 
     return success({
+        'message': 'Login successful',
+        'is_new': created,
         'user': {
-            'phone': user.phone,
             'name': user.name,
-            'is_driver': user.is_driver,
-            'is_approved': user.is_approved,
+            'email': user.email,
+            'is_driver': False,
         },
         'tokens': get_tokens(user)
     })
 
-# ─── DRIVER AUTH ────────────────────────────────────────────
+# ─── DRIVER — PHONE + OTP ─────────────────────────────────
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
@@ -110,47 +125,135 @@ def driver_register(request):
     name = request.data.get('name', '').strip()
     pin = request.data.get('pin', '').strip()
     license_no = request.data.get('license_no', '').strip()
+    rc_number = request.data.get('rc_number', '').strip()
     bus_number = request.data.get('bus_number', '').strip()
 
-    if not phone or not name:
-        return error('Phone and name required')
+    if not all([phone, name, pin, license_no, bus_number]):
+        return error('phone, name, pin, license_no, bus_number required')
 
     if len(pin) != 4 or not pin.isdigit():
         return error('PIN must be 4 digits')
 
-    if not license_no:
-        return error('License number required')
-
-    if not bus_number:
-        return error('Bus number required')
+    # Rate limit
+    rate_key = f'driver_register_{phone}'
+    if not check_rate_limit(rate_key, max_attempts=3, window=3600):
+        return error('Too many attempts. Try after 1 hour.', 429)
 
     if User.objects.filter(phone=phone).exists():
-        return error('User already exists')
+        return error('Phone already registered')
 
     user = User.objects.create_user(
         phone=phone,
         name=name,
         is_driver=True,
-        is_approved=False
+        is_approved=False,
     )
     user.pin = pin
     user.license_no = license_no
+    user.rc_number = rc_number
     user.bus_number = bus_number
     user.save()
 
-    otp = user.generate_otp()
+    otp, err = user.generate_otp()
+    if err:
+        return error(err)
+
     send_otp_sms(phone, otp)
 
     return success({
-        'message': 'Registration successful. OTP sent for verification.',
+        'message': 'OTP sent. Verify to complete registration.',
         'phone': phone,
     })
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def driver_upload_selfie(request):
+    phone = request.data.get('phone', '').strip()
+    selfie = request.FILES.get('selfie')
+
+    if not phone or not selfie:
+        return error('phone and selfie required')
+
+    try:
+        user = User.objects.get(phone=phone, is_driver=True)
+    except User.DoesNotExist:
+        return error('Driver not found', 404)
+
+    # Validate file
+    if selfie.size > 5 * 1024 * 1024:
+        return error('File too large. Max 5MB.')
+
+    allowed_types = ['image/jpeg', 'image/png', 'image/webp']
+    if selfie.content_type not in allowed_types:
+        return error('Only JPEG, PNG, WebP allowed')
+
+    # Upload to Firebase Storage
+    try:
+        import firebase_admin
+        from firebase_admin import storage
+        from PIL import Image
+        import io
+        import uuid
+
+        # Initialize firebase if not already
+        if not firebase_admin._apps:
+            import os
+            cred_path = '/storage/emulated/0/WHY/KTP/firebase_credentials.json'
+            if not os.path.exists(cred_path):
+                cred_path = 'firebase_credentials.json'
+            from firebase_admin import credentials
+            cred = credentials.Certificate(cred_path)
+            firebase_admin.initialize_app(cred, {
+                'storageBucket': 'YOUR_FIREBASE_BUCKET.appspot.com'
+            })
+
+        # Compress to WebP
+        img = Image.open(selfie)
+        img = img.convert('RGB')
+        img.thumbnail((400, 400))
+
+        buffer = io.BytesIO()
+        img.save(buffer, format='WebP', quality=80)
+        buffer.seek(0)
+
+        # Delete old selfie
+        if user.selfie_url:
+            try:
+                bucket = storage.bucket()
+                old_blob = bucket.blob(f'selfies/{user.id}_selfie.webp')
+                old_blob.delete()
+            except Exception:
+                pass
+
+        # Upload new
+        bucket = storage.bucket()
+        blob = bucket.blob(f'selfies/{user.id}_selfie.webp')
+        blob.upload_from_file(buffer, content_type='image/webp')
+        blob.make_public()
+
+        user.selfie_url = blob.public_url
+        user.save()
+
+        return success({
+            'message': 'Selfie uploaded',
+            'selfie_url': user.selfie_url
+        })
+
+    except Exception as e:
+        print(f"Upload error: {e}")
+        # Fallback — just save locally for now
+        return error(f'Upload failed: {str(e)}')
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def driver_verify_otp(request):
     phone = request.data.get('phone', '').strip()
     otp = request.data.get('otp', '').strip()
+
+    # Rate limit
+    rate_key = f'otp_verify_{phone}'
+    if not check_rate_limit(rate_key, max_attempts=5, window=600):
+        return error('Too many attempts. Try later.', 429)
 
     try:
         user = User.objects.get(phone=phone, is_driver=True)
@@ -163,15 +266,15 @@ def driver_verify_otp(request):
     if timezone.now() > user.otp_expires:
         return error('OTP expired')
 
-    # OTP verified — auto approve karo
+    # Verify karo — auto approve
     user.otp = None
     user.otp_expires = None
-    user.is_approved = True  # ← AUTO APPROVE
+    user.is_approved = True
     user.save()
 
     # Auto create bus
-    from buses.models import Bus, Route
     try:
+        from buses.models import Bus, Route
         route = Route.objects.first()
         if route and user.bus_number:
             bus, created = Bus.objects.get_or_create(
@@ -186,17 +289,17 @@ def driver_verify_otp(request):
                 bus.driver = user
                 bus.save()
     except Exception as e:
-        print(f"Bus creation error: {e}")
+        print(f"Bus error: {e}")
 
     return success({
-        'message': 'Phone verified. You can start driving!',
+        'message': 'Verified! You can start driving.',
         'is_approved': True,
-        'is_verified': False,  # Admin blue tick baad mein
         'user': {
             'phone': user.phone,
             'name': user.name,
             'is_driver': True,
             'is_approved': True,
+            'selfie_url': user.selfie_url,
         },
         'tokens': get_tokens(user)
     })
@@ -207,8 +310,10 @@ def driver_login(request):
     phone = request.data.get('phone', '').strip()
     pin = request.data.get('pin', '').strip()
 
-    if not phone or not pin:
-        return error('Phone and PIN required')
+    # Rate limit
+    rate_key = f'driver_login_{phone}'
+    if not check_rate_limit(rate_key, max_attempts=5, window=600):
+        return error('Too many failed attempts. Wait 10 minutes.', 429)
 
     try:
         user = User.objects.get(phone=phone, is_driver=True)
@@ -217,9 +322,6 @@ def driver_login(request):
 
     if user.pin != pin:
         return error('Wrong PIN')
-
-    if not user.is_approved:
-        return error('Driver not approved yet')
 
     if not user.is_active:
         return error('Account disabled')
@@ -234,12 +336,30 @@ def driver_login(request):
             'phone': user.phone,
             'name': user.name,
             'is_driver': True,
-            'is_approved': True,
+            'is_approved': user.is_approved,
+            'selfie_url': user.selfie_url,
         },
         'tokens': get_tokens(user)
     })
 
-# ─── FORGOT PIN — OTP ───────────────────────────────────────
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def resend_otp(request):
+    phone = request.data.get('phone', '').strip()
+
+    try:
+        user = User.objects.get(phone=phone, is_driver=True)
+    except User.DoesNotExist:
+        return error('Driver not found', 404)
+
+    otp, err = user.generate_otp()
+    if err:
+        return error(err)
+
+    send_otp_sms(phone, otp)
+    return success({'message': 'OTP resent'})
+
+# ─── FORGOT PIN ───────────────────────────────────────────
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
@@ -247,14 +367,16 @@ def forgot_pin(request):
     phone = request.data.get('phone', '').strip()
 
     try:
-        user = User.objects.get(phone=phone)
+        user = User.objects.get(phone=phone, is_driver=True)
     except User.DoesNotExist:
-        return error('User not found', 404)
+        return error('Driver not found', 404)
 
-    otp = user.generate_otp()
+    otp, err = user.generate_otp()
+    if err:
+        return error(err)
+
     send_otp_sms(phone, otp)
-
-    return success({'message': 'OTP sent'})
+    return success({'message': 'OTP sent for PIN reset'})
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
@@ -264,9 +386,9 @@ def reset_pin(request):
     new_pin = request.data.get('new_pin', '').strip()
 
     try:
-        user = User.objects.get(phone=phone)
+        user = User.objects.get(phone=phone, is_driver=True)
     except User.DoesNotExist:
-        return error('User not found', 404)
+        return error('Driver not found', 404)
 
     if user.otp != otp:
         return error('Wrong OTP')
@@ -284,17 +406,19 @@ def reset_pin(request):
 
     return success({'message': 'PIN reset successfully'})
 
-# ─── PROFILE ────────────────────────────────────────────────
+# ─── PROFILE ─────────────────────────────────────────────
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def profile(request):
     user = request.user
     return success({
-        'phone': user.phone,
         'name': user.name,
+        'email': user.email,
+        'phone': user.phone,
         'is_driver': user.is_driver,
         'is_approved': user.is_approved,
+        'selfie_url': user.selfie_url,
     })
 
 @api_view(['POST'])
@@ -305,7 +429,7 @@ def update_fcm(request):
         return error('FCM token required')
     request.user.fcm_token = token
     request.user.save()
-    return success({'message': 'FCM token updated'})
+    return success({'message': 'FCM updated'})
 
 @api_view(['GET'])
 @permission_classes([AllowAny])

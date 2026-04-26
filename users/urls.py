@@ -3,13 +3,14 @@ from rest_framework_simplejwt.views import TokenRefreshView
 from . import views
 
 urlpatterns = [
-    # Passenger auth
-    path('auth/register/', views.register),
-    path('auth/login/', views.login_passenger),
+    # Passenger Google Auth
+    path('auth/google/', views.google_login),
 
-    # Driver auth
+    # Driver Auth
     path('auth/driver/register/', views.driver_register),
+    path('auth/driver/upload-selfie/', views.driver_upload_selfie),
     path('auth/driver/verify-otp/', views.driver_verify_otp),
+    path('auth/driver/resend-otp/', views.resend_otp),
     path('auth/driver/login/', views.driver_login),
 
     # Forgot PIN
