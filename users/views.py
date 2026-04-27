@@ -179,71 +179,64 @@ def driver_upload_selfie(request):
     except User.DoesNotExist:
         return error('Driver not found', 404)
 
-    # Validate file
     if selfie.size > 5 * 1024 * 1024:
-        return error('File too large. Max 5MB.')
+        return error('Max 5MB allowed')
 
-    allowed_types = ['image/jpeg', 'image/png', 'image/webp']
-    if selfie.content_type not in allowed_types:
+    allowed = ['image/jpeg', 'image/png', 'image/webp']
+    if selfie.content_type not in allowed:
         return error('Only JPEG, PNG, WebP allowed')
 
-    # Upload to Firebase Storage
     try:
-        import firebase_admin
-        from firebase_admin import storage
         from PIL import Image
+        from decouple import config
         import io
-        import uuid
-
-        # Initialize firebase if not already
-        if not firebase_admin._apps:
-            import os
-            cred_path = '/storage/emulated/0/WHY/KTP/firebase_credentials.json'
-            if not os.path.exists(cred_path):
-                cred_path = 'firebase_credentials.json'
-            from firebase_admin import credentials
-            cred = credentials.Certificate(cred_path)
-            firebase_admin.initialize_app(cred, {
-                'storageBucket': 'YOUR_FIREBASE_BUCKET.appspot.com'
-            })
+        import requests as req
 
         # Compress to WebP
         img = Image.open(selfie)
         img = img.convert('RGB')
         img.thumbnail((400, 400))
-
         buffer = io.BytesIO()
         img.save(buffer, format='WebP', quality=80)
         buffer.seek(0)
 
-        # Delete old selfie
-        if user.selfie_url:
-            try:
-                bucket = storage.bucket()
-                old_blob = bucket.blob(f'selfies/{user.id}_selfie.webp')
-                old_blob.delete()
-            except Exception:
-                pass
+        # Supabase Storage
+        supabase_url = config('SUPABASE_URL')
+        supabase_key = config('SUPABASE_KEY')
+        bucket = 'ktp-selfies'
+        file_path = f'selfies/{user.id}_selfie.webp'
+
+        # Delete old if exists
+        req.delete(
+            f'{supabase_url}/storage/v1/object/{bucket}/{file_path}',
+            headers={'Authorization': f'Bearer {supabase_key}'}
+        )
 
         # Upload new
-        bucket = storage.bucket()
-        blob = bucket.blob(f'selfies/{user.id}_selfie.webp')
-        blob.upload_from_file(buffer, content_type='image/webp')
-        blob.make_public()
+        response = req.post(
+            f'{supabase_url}/storage/v1/object/{bucket}/{file_path}',
+            headers={
+                'Authorization': f'Bearer {supabase_key}',
+                'Content-Type': 'image/webp',
+            },
+            data=buffer.getvalue()
+        )
 
-        user.selfie_url = blob.public_url
+        if response.status_code not in [200, 201]:
+            return error('Upload failed')
+
+        public_url = f'{supabase_url}/storage/v1/object/public/{bucket}/{file_path}'
+        user.selfie_url = public_url
         user.save()
 
         return success({
             'message': 'Selfie uploaded',
-            'selfie_url': user.selfie_url
+            'selfie_url': public_url
         })
 
     except Exception as e:
         print(f"Upload error: {e}")
-        # Fallback — just save locally for now
         return error(f'Upload failed: {str(e)}')
-
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def driver_verify_otp(request):
