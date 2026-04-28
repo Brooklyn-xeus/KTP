@@ -54,4 +54,20 @@ path('driver/passenger-count/', views.update_passenger_count),
 # Arrival
 path('driver/arrival/', views.confirm_arrival),
 path('driver/trip/next-stops/', views.next_stops),
+# Trip history
+path('driver/trips/', views.driver_trip_history),
+path('passenger/trips/', views.passenger_trip_history),
+
+# Safe endpoints with fraud detection
+path('driver/update-location-safe/', views.update_location_safe),
+path('passenger/waiting-safe/', views.mark_waiting_safe),
+
+# Bus with status
+path('buses/status/', views.get_buses_with_status),
+
+# Admin
+path('admin/drivers/', views.admin_drivers),
+path('admin/verify-driver/', views.admin_verify_driver),
+path('admin/trips/', views.admin_active_trips),
+path('admin/emergencies/', views.admin_emergency_alerts),
 ]
