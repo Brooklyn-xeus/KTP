@@ -24,26 +24,32 @@ def error(msg, status=400):
     return Response({'success': False, 'message': msg}, status=status)
 
 def send_otp_sms(phone, otp):
+    # Firebase Phone Auth use karo production mein
+    # Abhi ke liye print karo testing ke liye
+    print(f"📱 OTP for {phone}: {otp}")
+    
+    # Fast2SMS Quick SMS — agar credit hai
     from decouple import config
     api_key = config('FAST2SMS_API_KEY', default=None)
-    if not api_key:
-        print(f"OTP for {phone}: {otp}")
-        return True
-    try:
-        response = http_requests.post(
-            "https://www.fast2sms.com/dev/bulkV2",
-            json={
-                "route": "otp",
-                "variables_values": otp,
-                "flash": 0,
-                "numbers": phone,
-            },
-            headers={"authorization": api_key}
-        )
-        return response.json().get('return', False)
-    except Exception as e:
-        print(f"SMS Error: {e}")
-        return False
+    if api_key:
+        try:
+            import requests as req
+            response = req.post(
+                "https://www.fast2sms.com/dev/bulkV2",
+                headers={"authorization": api_key},
+                json={
+                    "route": "q",  # Quick SMS — no DLT
+                    "message": f"Your KTP verification OTP is {otp}. Valid for 40 minutes.",
+                    "language": "english",
+                    "flash": 0,
+                    "numbers": phone,
+                }
+            )
+            print(f"SMS Response: {response.json()}")
+            return True
+        except Exception as e:
+            print(f"SMS Error: {e}")
+    return True
 
 def check_rate_limit(key, max_attempts=5, window=600):
     attempts = cache.get(key, 0)
@@ -236,30 +242,59 @@ def driver_upload_selfie(request):
 
     except Exception as e:
         print(f"Upload error: {e}")
-        return error(f'Upload failed: {str(e)}')
+        return error(f'Upload failed: {str(e)}')               
+
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def driver_verify_otp(request):
     phone = request.data.get('phone', '').strip()
+    firebase_token = request.data.get('firebase_token', '').strip()
+    
+    # Old OTP system fallback
     otp = request.data.get('otp', '').strip()
 
-    # Rate limit
-    rate_key = f'otp_verify_{phone}'
-    if not check_rate_limit(rate_key, max_attempts=5, window=600):
-        return error('Too many attempts. Try later.', 429)
+    if not phone:
+        return error('Phone required')
 
     try:
         user = User.objects.get(phone=phone, is_driver=True)
     except User.DoesNotExist:
         return error('Driver not found', 404)
 
-    if user.otp != otp:
-        return error('Wrong OTP')
+    # Firebase token verify
+    if firebase_token:
+        try:
+            import firebase_admin
+            from firebase_admin import auth as firebase_auth
+            
+            if not firebase_admin._apps:
+                import os
+                from firebase_admin import credentials
+                cred_path = 'firebase_credentials.json'
+                cred = credentials.Certificate(cred_path)
+                firebase_admin.initialize_app(cred)
 
-    if timezone.now() > user.otp_expires:
-        return error('OTP expired')
+            decoded = firebase_auth.verify_id_token(firebase_token)
+            firebase_phone = decoded.get('phone_number', '')
+            
+            # Normalize phone
+            clean_phone = firebase_phone.replace('+91', '').strip()
+            if clean_phone != phone and firebase_phone != phone:
+                return error('Phone number mismatch')
 
-    # Verify karo — auto approve
+        except Exception as e:
+            return error(f'Firebase verification failed: {str(e)}')
+
+    # Old OTP fallback (testing)
+    elif otp:
+        if user.otp != otp:
+            return error('Wrong OTP')
+        if timezone.now() > user.otp_expires:
+            return error('OTP expired')
+    else:
+        return error('firebase_token or otp required')
+
+    # Verify success
     user.otp = None
     user.otp_expires = None
     user.is_approved = True
