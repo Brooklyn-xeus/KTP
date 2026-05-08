@@ -1,6 +1,7 @@
 from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
 from django.db import models
 import random
+import hashlib
 
 class UserManager(BaseUserManager):
     def create_user(self, phone=None, name=None, email=None, password=None, **extra_fields):
@@ -58,9 +59,32 @@ class User(AbstractBaseUser, PermissionsMixin):
     objects = UserManager()
 
     def generate_otp(self):
-        from django.utils import timezone
-        now = timezone.now()
+    from django.utils import timezone
+    import random
+    now = timezone.now()
 
+    if self.otp_window_start:
+        diff = (now - self.otp_window_start).total_seconds()
+        if diff > 3600:
+            self.otp_count = 0
+            self.otp_window_start = now
+    else:
+        self.otp_window_start = now
+
+    if self.otp_count >= 3:
+        return None, 'OTP limit reached. Try after 1 hour.'
+
+    if self.last_otp_sent:
+        gap = (now - self.last_otp_sent).total_seconds()
+        if gap < 30:
+            return None, f'Wait {int(30 - gap)} seconds before requesting again'
+
+    self.otp = str(random.randint(100000, 999999))
+    self.otp_expires = now + timezone.timedelta(minutes=5)  # 5 min only
+    self.otp_count += 1
+    self.last_otp_sent = now
+    self.save()
+    return self.otp, None
         # Reset window agar 1 hour se zyada ho gaya
         if self.otp_window_start:
             diff = (now - self.otp_window_start).total_seconds()
@@ -89,3 +113,30 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     def __str__(self):
         return f"{self.name} ({'Driver' if self.is_driver else 'Passenger'})"
+
+class RefreshTokenStore(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='refresh_tokens')
+    token_hash = models.CharField(max_length=64, unique=True)
+    device_fingerprint = models.CharField(max_length=200, blank=True, null=True)
+    ip_address = models.GenericIPAddressField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    is_revoked = models.BooleanField(default=False)
+
+    @staticmethod
+    def hash_token(token):
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    def __str__(self):
+        return f"{self.user.name} — {'revoked' if self.is_revoked else 'active'}"
+
+class OTPAttemptLog(models.Model):
+    phone = models.CharField(max_length=15)
+    ip_address = models.GenericIPAddressField(blank=True, null=True)
+    device_fingerprint = models.CharField(max_length=200, blank=True, null=True)
+    otp_entered = models.CharField(max_length=6)
+    success = models.BooleanField(default=False)
+    attempted_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.phone} — {'✓' if self.success else '✗'} @ {self.attempted_at}"

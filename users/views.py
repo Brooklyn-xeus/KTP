@@ -4,52 +4,66 @@ from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.utils import timezone
 from django.core.cache import cache
-from .models import User
-import requests as http_requests
+from django.db import transaction
+from .models import User, RefreshTokenStore, OTPAttemptLog
+import uuid
+import logging
+import sentry_sdk
 
-def get_tokens(user):
-    refresh = RefreshToken.for_user(user)
-    refresh['name'] = user.name
-    refresh['is_driver'] = user.is_driver
-    refresh['is_approved'] = user.is_approved
-    return {
-        'access': str(refresh.access_token),
-        'refresh': str(refresh),
-    }
+logger = logging.getLogger(__name__)
+
+# ─── ERROR CODES ───────────────────────────────────────────
 
 def success(data):
     return Response({'success': True, 'data': data})
 
-def error(msg, status=400):
-    return Response({'success': False, 'message': msg}, status=status)
+def error(msg, status=400, code='VALIDATION_ERROR'):
+    return Response({
+        'success': False,
+        'error_code': code,
+        'message': msg
+    }, status=status)
 
-def send_otp_sms(phone, otp):
-    # Firebase Phone Auth use karo production mein
-    # Abhi ke liye print karo testing ke liye
-    print(f"📱 OTP for {phone}: {otp}")
-    
-    # Fast2SMS Quick SMS — agar credit hai
-    from decouple import config
-    api_key = config('FAST2SMS_API_KEY', default=None)
-    if api_key:
-        try:
-            import requests as req
-            response = req.post(
-                "https://www.fast2sms.com/dev/bulkV2",
-                headers={"authorization": api_key},
-                json={
-                    "route": "q",  # Quick SMS — no DLT
-                    "message": f"Your KTP verification OTP is {otp}. Valid for 40 minutes.",
-                    "language": "english",
-                    "flash": 0,
-                    "numbers": phone,
-                }
-            )
-            print(f"SMS Response: {response.json()}")
-            return True
-        except Exception as e:
-            print(f"SMS Error: {e}")
-    return True
+def auth_error(msg, status=401):
+    return error(msg, status, 'AUTH_ERROR')
+
+def rate_limit_error(msg):
+    return error(msg, 429, 'RATE_LIMIT')
+
+def server_error(msg='Something went wrong'):
+    return error(msg, 500, 'SERVER_ERROR')
+
+# ─── HELPERS ───────────────────────────────────────────────
+
+def get_client_ip(request):
+    x_forwarded = request.META.get('HTTP_X_FORWARDED_FOR')
+    if x_forwarded:
+        return x_forwarded.split(',')[0].strip()
+    return request.META.get('REMOTE_ADDR', '')
+
+def get_tokens(user, request=None):
+    refresh = RefreshToken.for_user(user)
+    refresh['name'] = user.name
+    refresh['is_driver'] = user.is_driver
+    refresh['is_approved'] = user.is_approved
+
+    # Store refresh token hash
+    from django.utils import timezone
+    expires_at = timezone.now() + timezone.timedelta(days=7)
+    token_hash = RefreshTokenStore.hash_token(str(refresh))
+
+    RefreshTokenStore.objects.create(
+        user=user,
+        token_hash=token_hash,
+        ip_address=get_client_ip(request) if request else None,
+        expires_at=expires_at,
+    )
+
+    return {
+        'access': str(refresh.access_token),
+        'refresh': str(refresh),
+        'access_expires_in': 1800,  # 30 min in seconds
+    }
 
 def check_rate_limit(key, max_attempts=5, window=600):
     attempts = cache.get(key, 0)
@@ -58,44 +72,84 @@ def check_rate_limit(key, max_attempts=5, window=600):
     cache.set(key, attempts + 1, timeout=window)
     return True
 
-# ─── PASSENGER — GOOGLE AUTH ──────────────────────────────
+def log_otp_attempt(phone, ip, device, otp_entered, success_flag):
+    try:
+        OTPAttemptLog.objects.create(
+            phone=phone,
+            ip_address=ip,
+            device_fingerprint=device,
+            otp_entered=otp_entered,
+            success=success_flag,
+        )
+    except Exception as e:
+        logger.error(f"OTP log error: {e}")
+
+def send_otp_sms(phone, otp):
+    from decouple import config
+    logger.info(f"OTP requested for {phone}")
+    api_key = config('FAST2SMS_API_KEY', default=None)
+    if api_key:
+        try:
+            import requests as req
+            response = req.post(
+                "https://www.fast2sms.com/dev/bulkV2",
+                headers={"authorization": api_key},
+                json={
+                    "route": "q",
+                    "message": f"Your KTP OTP is {otp}. Valid 5 min. Do not share.",
+                    "language": "english",
+                    "flash": 0,
+                    "numbers": phone,
+                }
+            )
+            logger.info(f"SMS response: {response.json()}")
+        except Exception as e:
+            logger.error(f"SMS error: {e}")
+            sentry_sdk.capture_exception(e)
+    else:
+        print(f"📱 OTP for {phone}: {otp}")
+
+# ─── PASSENGER GOOGLE AUTH ─────────────────────────────────
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def google_login(request):
+    request_id = str(uuid.uuid4())[:8]
     id_token = request.data.get('id_token')
     device_fingerprint = request.data.get('device_fingerprint', '')
+    ip = get_client_ip(request)
 
     if not id_token:
         return error('id_token required')
 
-    # Rate limit by device
-    if device_fingerprint:
-        rate_key = f'google_login_{device_fingerprint}'
-        if not check_rate_limit(rate_key, max_attempts=10, window=3600):
-            return error('Too many attempts. Try later.', 429)
+    # Rate limit by IP
+    if not check_rate_limit(f'google_{ip}', max_attempts=10, window=3600):
+        logger.warning(f"[{request_id}] Google login rate limit: {ip}")
+        return rate_limit_error('Too many attempts. Try later.')
 
-    # Verify Google token
     try:
-        google_response = http_requests.get(
-            f'https://oauth2.googleapis.com/tokeninfo?id_token={id_token}'
+        import requests as req
+        google_resp = req.get(
+            f'https://oauth2.googleapis.com/tokeninfo?id_token={id_token}',
+            timeout=5
         )
-        google_data = google_response.json()
+        google_data = google_resp.json()
 
         if 'error' in google_data:
-            return error('Invalid Google token')
+            return auth_error('Invalid Google token')
 
         google_id = google_data.get('sub')
         email = google_data.get('email')
         name = google_data.get('name', email.split('@')[0] if email else 'User')
 
         if not google_id:
-            return error('Invalid Google token')
+            return auth_error('Invalid Google token')
 
     except Exception as e:
-        return error(f'Token verification failed: {str(e)}')
+        logger.error(f"[{request_id}] Google verify error: {e}")
+        sentry_sdk.capture_exception(e)
+        return server_error('Google verification failed')
 
-    # Get or create user
     user, created = User.objects.get_or_create(
         google_id=google_id,
         defaults={
@@ -107,221 +161,207 @@ def google_login(request):
         }
     )
 
-    if not created and device_fingerprint:
-        user.device_fingerprint = device_fingerprint
-        user.save()
+    logger.info(f"[{request_id}] Google login: {user.id} ({'new' if created else 'existing'})")
 
     return success({
-        'message': 'Login successful',
         'is_new': created,
         'user': {
             'name': user.name,
             'email': user.email,
             'is_driver': False,
         },
-        'tokens': get_tokens(user)
+        'tokens': get_tokens(user, request)
     })
 
-# ─── DRIVER — PHONE + OTP ─────────────────────────────────
+# ─── DRIVER REGISTER ───────────────────────────────────────
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def driver_register(request):
+    request_id = str(uuid.uuid4())[:8]
     phone = request.data.get('phone', '').strip()
     name = request.data.get('name', '').strip()
     pin = request.data.get('pin', '').strip()
     license_no = request.data.get('license_no', '').strip()
     rc_number = request.data.get('rc_number', '').strip()
     bus_number = request.data.get('bus_number', '').strip()
+    ip = get_client_ip(request)
 
+    # Validate
     if not all([phone, name, pin, license_no, bus_number]):
         return error('phone, name, pin, license_no, bus_number required')
 
     if len(pin) != 4 or not pin.isdigit():
         return error('PIN must be 4 digits')
 
-    # Rate limit
-    rate_key = f'driver_register_{phone}'
-    if not check_rate_limit(rate_key, max_attempts=3, window=3600):
-        return error('Too many attempts. Try after 1 hour.', 429)
+    if len(phone) != 10 or not phone.isdigit():
+        return error('Invalid phone number')
 
+    # Rate limit by phone + IP
+    if not check_rate_limit(f'dreg_{phone}', 3, 3600):
+        return rate_limit_error('Too many registration attempts')
+    if not check_rate_limit(f'dreg_ip_{ip}', 5, 3600):
+        return rate_limit_error('Too many requests from this device')
+
+    # Duplicate check
     if User.objects.filter(phone=phone).exists():
         return error('Phone already registered')
 
-    user = User.objects.create_user(
-        phone=phone,
-        name=name,
-        is_driver=True,
-        is_approved=False,
-    )
-    user.pin = pin
-    user.license_no = license_no
-    user.rc_number = rc_number
-    user.bus_number = bus_number
-    user.save()
+    if User.objects.filter(bus_number=bus_number).exists():
+        return error('Bus number already registered')
+
+    with transaction.atomic():
+        user = User.objects.create_user(
+            phone=phone,
+            name=name,
+            is_driver=True,
+            is_approved=False,
+        )
+        user.pin = pin
+        user.license_no = license_no
+        user.rc_number = rc_number
+        user.bus_number = bus_number
+        user.save()
 
     otp, err = user.generate_otp()
     if err:
-        return error(err)
+        return rate_limit_error(err)
 
     send_otp_sms(phone, otp)
+    logger.info(f"[{request_id}] Driver registered: {phone}")
 
     return success({
-        'message': 'OTP sent. Verify to complete registration.',
+        'message': 'OTP sent. Verify your phone to complete registration.',
         'phone': phone,
     })
 
-@api_view(['POST'])
-@permission_classes([AllowAny])
-def driver_upload_selfie(request):
-    phone = request.data.get('phone', '').strip()
-    selfie = request.FILES.get('selfie')
-
-    if not phone or not selfie:
-        return error('phone and selfie required')
-
-    try:
-        user = User.objects.get(phone=phone, is_driver=True)
-    except User.DoesNotExist:
-        return error('Driver not found', 404)
-
-    if selfie.size > 5 * 1024 * 1024:
-        return error('Max 5MB allowed')
-
-    allowed = ['image/jpeg', 'image/png', 'image/webp']
-    if selfie.content_type not in allowed:
-        return error('Only JPEG, PNG, WebP allowed')
-
-    try:
-        from PIL import Image
-        from decouple import config
-        import io
-        import requests as req
-
-        # Compress to WebP
-        img = Image.open(selfie)
-        img = img.convert('RGB')
-        img.thumbnail((400, 400))
-        buffer = io.BytesIO()
-        img.save(buffer, format='WebP', quality=80)
-        buffer.seek(0)
-
-        # Supabase Storage
-        supabase_url = config('SUPABASE_URL')
-        supabase_key = config('SUPABASE_KEY')
-        bucket = 'ktp-selfies'
-        file_path = f'selfies/{user.id}_selfie.webp'
-
-        # Delete old if exists
-        req.delete(
-            f'{supabase_url}/storage/v1/object/{bucket}/{file_path}',
-            headers={'Authorization': f'Bearer {supabase_key}'}
-        )
-
-        # Upload new
-        response = req.post(
-            f'{supabase_url}/storage/v1/object/{bucket}/{file_path}',
-            headers={
-                'Authorization': f'Bearer {supabase_key}',
-                'Content-Type': 'image/webp',
-            },
-            data=buffer.getvalue()
-        )
-
-        if response.status_code not in [200, 201]:
-            return error('Upload failed')
-
-        public_url = f'{supabase_url}/storage/v1/object/public/{bucket}/{file_path}'
-        user.selfie_url = public_url
-        user.save()
-
-        return success({
-            'message': 'Selfie uploaded',
-            'selfie_url': public_url
-        })
-
-    except Exception as e:
-        print(f"Upload error: {e}")
-        return error(f'Upload failed: {str(e)}')               
+# ─── DRIVER VERIFY OTP ─────────────────────────────────────
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def driver_verify_otp(request):
+    request_id = str(uuid.uuid4())[:8]
     phone = request.data.get('phone', '').strip()
     firebase_token = request.data.get('firebase_token', '').strip()
-    
-    # Old OTP system fallback
     otp = request.data.get('otp', '').strip()
+    ip = get_client_ip(request)
+    device = request.data.get('device_fingerprint', '')
 
     if not phone:
         return error('Phone required')
+
+    # Rate limit OTP attempts
+    if not check_rate_limit(f'otp_{phone}', 5, 600):
+        log_otp_attempt(phone, ip, device, otp, False)
+        return rate_limit_error('Too many OTP attempts. Wait 10 minutes.')
 
     try:
         user = User.objects.get(phone=phone, is_driver=True)
     except User.DoesNotExist:
         return error('Driver not found', 404)
 
-    # Firebase token verify
+    verified = False
+
     if firebase_token:
         try:
             import firebase_admin
             from firebase_admin import auth as firebase_auth
-            
             if not firebase_admin._apps:
-                import os
                 from firebase_admin import credentials
-                cred_path = 'firebase_credentials.json'
-                cred = credentials.Certificate(cred_path)
+                cred = credentials.Certificate('firebase_credentials.json')
                 firebase_admin.initialize_app(cred)
 
             decoded = firebase_auth.verify_id_token(firebase_token)
-            firebase_phone = decoded.get('phone_number', '')
-            
-            # Normalize phone
-            clean_phone = firebase_phone.replace('+91', '').strip()
-            if clean_phone != phone and firebase_phone != phone:
-                return error('Phone number mismatch')
+            firebase_phone = decoded.get('phone_number', '').replace('+91', '').strip()
+
+            if firebase_phone == phone:
+                verified = True
+            else:
+                log_otp_attempt(phone, ip, device, 'firebase', False)
+                return auth_error('Phone number mismatch')
 
         except Exception as e:
-            return error(f'Firebase verification failed: {str(e)}')
+            logger.error(f"[{request_id}] Firebase error: {e}")
+            return auth_error('Firebase verification failed')
 
-    # Old OTP fallback (testing)
     elif otp:
         if user.otp != otp:
-            return error('Wrong OTP')
+            log_otp_attempt(phone, ip, device, otp, False)
+            return auth_error('Wrong OTP')
         if timezone.now() > user.otp_expires:
-            return error('OTP expired')
+            log_otp_attempt(phone, ip, device, otp, False)
+            return auth_error('OTP expired')
+        verified = True
     else:
         return error('firebase_token or otp required')
 
-    # Verify success
-    user.otp = None
-    user.otp_expires = None
-    user.is_approved = True
-    user.save()
+    if verified:
+        log_otp_attempt(phone, ip, device, otp or 'firebase', True)
+        # OTP invalidate
+        user.otp = None
+        user.otp_expires = None
+        # NOT auto-approved — pending admin review
+        user.save()
 
-    # Auto create bus
+        logger.info(f"[{request_id}] Driver OTP verified: {phone} — pending admin approval")
+
+        return success({
+            'message': 'Phone verified! Your documents are under review (24-48 hours). Contact support if needed.',
+            'status': 'pending',
+            'is_approved': False,
+            'support_phone': '9999999999',
+            'support_email': 'support@ktp.app',
+        })
+
+# ─── DRIVER LOGIN ──────────────────────────────────────────
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def driver_login(request):
+    request_id = str(uuid.uuid4())[:8]
+    phone = request.data.get('phone', '').strip()
+    pin = request.data.get('pin', '').strip()
+    ip = get_client_ip(request)
+
+    if not phone or not pin:
+        return error('Phone and PIN required')
+
+    if not check_rate_limit(f'dlogin_{phone}', 5, 600):
+        return rate_limit_error('Too many attempts. Wait 10 minutes.')
+
+    if not check_rate_limit(f'dlogin_ip_{ip}', 10, 600):
+        return rate_limit_error('Too many requests from this device.')
+
     try:
-        from buses.models import Bus, Route
-        route = Route.objects.first()
-        if route and user.bus_number:
-            bus, created = Bus.objects.get_or_create(
-                plate_number=user.bus_number,
-                defaults={
-                    'route': route,
-                    'driver': user,
-                    'is_active': False,
-                }
-            )
-            if not created and bus.driver is None:
-                bus.driver = user
-                bus.save()
-    except Exception as e:
-        print(f"Bus error: {e}")
+        user = User.objects.get(phone=phone, is_driver=True)
+    except User.DoesNotExist:
+        return auth_error('Driver not found')
+
+    if user.pin != pin:
+        logger.warning(f"[{request_id}] Wrong PIN: {phone}")
+        return auth_error('Wrong PIN')
+
+    if not user.is_active:
+        return auth_error('Account disabled. Contact support.')
+
+    if not user.is_approved:
+        return Response({
+            'success': False,
+            'error_code': 'PENDING_APPROVAL',
+            'message': 'Your account is under review (24-48 hours).',
+            'status': 'pending',
+            'support_phone': '9999999999',
+            'support_email': 'support@ktp.app',
+        }, status=403)
+
+    fcm_token = request.data.get('fcm_token')
+    if fcm_token:
+        user.fcm_token = fcm_token
+        user.save()
+
+    logger.info(f"[{request_id}] Driver login: {phone}")
 
     return success({
-        'message': 'Verified! You can start driving.',
-        'is_approved': True,
         'user': {
             'phone': user.phone,
             'name': user.name,
@@ -329,51 +369,41 @@ def driver_verify_otp(request):
             'is_approved': True,
             'selfie_url': user.selfie_url,
         },
-        'tokens': get_tokens(user)
+        'tokens': get_tokens(user, request)
     })
+
+# ─── LOGOUT ────────────────────────────────────────────────
 
 @api_view(['POST'])
-@permission_classes([AllowAny])
-def driver_login(request):
-    phone = request.data.get('phone', '').strip()
-    pin = request.data.get('pin', '').strip()
+@permission_classes([IsAuthenticated])
+def logout(request):
+    refresh_token = request.data.get('refresh_token')
+    if refresh_token:
+        token_hash = RefreshTokenStore.hash_token(refresh_token)
+        RefreshTokenStore.objects.filter(
+            token_hash=token_hash
+        ).update(is_revoked=True)
 
-    # Rate limit
-    rate_key = f'driver_login_{phone}'
-    if not check_rate_limit(rate_key, max_attempts=5, window=600):
-        return error('Too many failed attempts. Wait 10 minutes.', 429)
+    logger.info(f"User {request.user.id} logged out")
+    return success({'message': 'Logged out successfully'})
 
-    try:
-        user = User.objects.get(phone=phone, is_driver=True)
-    except User.DoesNotExist:
-        return error('Driver not found', 404)
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def logout_all_devices(request):
+    RefreshTokenStore.objects.filter(
+        user=request.user, is_revoked=False
+    ).update(is_revoked=True)
 
-    if user.pin != pin:
-        return error('Wrong PIN')
+    logger.info(f"User {request.user.id} logged out all devices")
+    return success({'message': 'Logged out from all devices'})
 
-    if not user.is_active:
-        return error('Account disabled')
-
-    fcm_token = request.data.get('fcm_token')
-    if fcm_token:
-        user.fcm_token = fcm_token
-        user.save()
-
-    return success({
-        'user': {
-            'phone': user.phone,
-            'name': user.name,
-            'is_driver': True,
-            'is_approved': user.is_approved,
-            'selfie_url': user.selfie_url,
-        },
-        'tokens': get_tokens(user)
-    })
+# ─── RESEND OTP ────────────────────────────────────────────
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def resend_otp(request):
     phone = request.data.get('phone', '').strip()
+    ip = get_client_ip(request)
 
     try:
         user = User.objects.get(phone=phone, is_driver=True)
@@ -382,17 +412,21 @@ def resend_otp(request):
 
     otp, err = user.generate_otp()
     if err:
-        return error(err)
+        return rate_limit_error(err)
 
     send_otp_sms(phone, otp)
     return success({'message': 'OTP resent'})
 
-# ─── FORGOT PIN ───────────────────────────────────────────
+# ─── FORGOT + RESET PIN ────────────────────────────────────
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def forgot_pin(request):
     phone = request.data.get('phone', '').strip()
+    ip = get_client_ip(request)
+
+    if not check_rate_limit(f'forgot_{phone}_{ip}', 3, 3600):
+        return rate_limit_error('Too many requests')
 
     try:
         user = User.objects.get(phone=phone, is_driver=True)
@@ -401,10 +435,10 @@ def forgot_pin(request):
 
     otp, err = user.generate_otp()
     if err:
-        return error(err)
+        return rate_limit_error(err)
 
     send_otp_sms(phone, otp)
-    return success({'message': 'OTP sent for PIN reset'})
+    return success({'message': 'OTP sent'})
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
@@ -412,6 +446,10 @@ def reset_pin(request):
     phone = request.data.get('phone', '').strip()
     otp = request.data.get('otp', '').strip()
     new_pin = request.data.get('new_pin', '').strip()
+    ip = get_client_ip(request)
+
+    if not check_rate_limit(f'reset_{phone}', 5, 600):
+        return rate_limit_error('Too many attempts')
 
     try:
         user = User.objects.get(phone=phone, is_driver=True)
@@ -419,10 +457,11 @@ def reset_pin(request):
         return error('Driver not found', 404)
 
     if user.otp != otp:
-        return error('Wrong OTP')
+        log_otp_attempt(phone, ip, '', otp, False)
+        return auth_error('Wrong OTP')
 
     if timezone.now() > user.otp_expires:
-        return error('OTP expired')
+        return auth_error('OTP expired')
 
     if len(new_pin) != 4 or not new_pin.isdigit():
         return error('PIN must be 4 digits')
@@ -432,9 +471,12 @@ def reset_pin(request):
     user.otp_expires = None
     user.save()
 
+    log_otp_attempt(phone, ip, '', otp, True)
+    logger.info(f"PIN reset: {phone}")
+
     return success({'message': 'PIN reset successfully'})
 
-# ─── PROFILE ─────────────────────────────────────────────
+# ─── PROFILE + FCM ─────────────────────────────────────────
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -470,3 +512,72 @@ def create_admin(request):
         )
         return success({'message': 'Admin created'})
     return success({'message': 'Already exists'})
+
+# ─── DRIVER SELFIE ─────────────────────────────────────────
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def driver_upload_selfie(request):
+    phone = request.data.get('phone', '').strip()
+    selfie = request.FILES.get('selfie')
+
+    if not phone or not selfie:
+        return error('phone and selfie required')
+
+    try:
+        user = User.objects.get(phone=phone, is_driver=True)
+    except User.DoesNotExist:
+        return error('Driver not found', 404)
+
+    if selfie.size > 5 * 1024 * 1024:
+        return error('Max 5MB allowed')
+
+    allowed = ['image/jpeg', 'image/png', 'image/webp']
+    if selfie.content_type not in allowed:
+        return error('Only JPEG, PNG, WebP allowed')
+
+    try:
+        from PIL import Image
+        from decouple import config
+        import io
+        import requests as req
+
+        img = Image.open(selfie)
+        img = img.convert('RGB')
+        img.thumbnail((400, 400))
+        buffer = io.BytesIO()
+        img.save(buffer, format='WebP', quality=80)
+        buffer.seek(0)
+
+        supabase_url = config('SUPABASE_URL')
+        supabase_key = config('SUPABASE_KEY')
+        bucket = 'ktp-selfies'
+        file_path = f'selfies/{user.id}_selfie.webp'
+
+        req.delete(
+            f'{supabase_url}/storage/v1/object/{bucket}/{file_path}',
+            headers={'Authorization': f'Bearer {supabase_key}'}
+        )
+
+        response = req.post(
+            f'{supabase_url}/storage/v1/object/{bucket}/{file_path}',
+            headers={
+                'Authorization': f'Bearer {supabase_key}',
+                'Content-Type': 'image/webp',
+            },
+            data=buffer.getvalue()
+        )
+
+        if response.status_code not in [200, 201]:
+            return error('Upload failed')
+
+        public_url = f'{supabase_url}/storage/v1/object/public/{bucket}/{file_path}'
+        user.selfie_url = public_url
+        user.save()
+
+        return success({'message': 'Selfie uploaded', 'selfie_url': public_url})
+
+    except Exception as e:
+        logger.error(f"Selfie upload error: {e}")
+        sentry_sdk.capture_exception(e)
+        return server_error('Upload failed')

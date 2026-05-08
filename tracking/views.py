@@ -15,6 +15,7 @@ from .models import (BusLocation, PassengerWaiting, Subscription,
                      NotificationLog, Trip, LocationSharingSession,
                      DriverFrequentRoute)
 from buses.models import Bus, Route, Stop, RouteStop
+import math
 
 def success(data):
     return Response({'success': True, 'data': data})
@@ -329,13 +330,34 @@ def got_bus(request):
     PassengerWaiting.objects.filter(user=request.user, got_bus=False).update(got_bus=True)
     return success({'message': 'Marked as got bus'})
 
+def mask_coordinates(lat, lng, precision=0.001):
+    """
+    Grid masking — ~100 meter precision
+    Rounds to nearest grid point
+    """
+    masked_lat = round(round(lat / precision) * precision, 6)
+    masked_lng = round(round(lng / precision) * precision, 6)
+    return masked_lat, masked_lng
+
 @api_view(['GET'])
-@permission_classes([AllowAny])
+@permission_classes([IsAuthenticated])  # Now requires auth
 def get_waiting_passengers(request, route_id):
     waiting = PassengerWaiting.objects.filter(
         route_id=route_id, got_bus=False
-    ).values('lat', 'lng', 'user__name', 'from_stop__name', 'to_stop__name')
-    return success({'passengers': list(waiting)})
+    ).values('lat', 'lng', 'from_stop__name', 'to_stop__name')
+
+    # Mask coordinates
+    masked = []
+    for p in waiting:
+        mlat, mlng = mask_coordinates(p['lat'], p['lng'])
+        masked.append({
+            'lat': mlat,
+            'lng': mlng,
+            'from_stop': p['from_stop__name'],
+            'to_stop': p['to_stop__name'],
+        })
+
+    return success({'passengers': masked})
 
 # ─── SUBSCRIBE ─────────────────────────────────────────────
 

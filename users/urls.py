@@ -3,10 +3,10 @@ from rest_framework_simplejwt.views import TokenRefreshView
 from . import views
 
 urlpatterns = [
-    # Passenger Google Auth
+    # Passenger
     path('auth/google/', views.google_login),
 
-    # Driver Auth
+    # Driver
     path('auth/driver/register/', views.driver_register),
     path('auth/driver/upload-selfie/', views.driver_upload_selfie),
     path('auth/driver/verify-otp/', views.driver_verify_otp),
@@ -16,6 +16,10 @@ urlpatterns = [
     # Forgot PIN
     path('auth/forgot-pin/', views.forgot_pin),
     path('auth/reset-pin/', views.reset_pin),
+
+    # Session
+    path('auth/logout/', views.logout),
+    path('auth/logout-all/', views.logout_all_devices),
 
     # Common
     path('auth/refresh/', TokenRefreshView.as_view()),
