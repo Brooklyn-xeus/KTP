@@ -57,35 +57,10 @@ class User(AbstractBaseUser, PermissionsMixin):
     USERNAME_FIELD = 'phone'
     REQUIRED_FIELDS = ['name']
     objects = UserManager()
-
+    
     def generate_otp(self):
-    from django.utils import timezone
-    import random
-    now = timezone.now()
-
-    if self.otp_window_start:
-        diff = (now - self.otp_window_start).total_seconds()
-        if diff > 3600:
-            self.otp_count = 0
-            self.otp_window_start = now
-    else:
-        self.otp_window_start = now
-
-    if self.otp_count >= 3:
-        return None, 'OTP limit reached. Try after 1 hour.'
-
-    if self.last_otp_sent:
-        gap = (now - self.last_otp_sent).total_seconds()
-        if gap < 30:
-            return None, f'Wait {int(30 - gap)} seconds before requesting again'
-
-    self.otp = str(random.randint(100000, 999999))
-    self.otp_expires = now + timezone.timedelta(minutes=5)  # 5 min only
-    self.otp_count += 1
-    self.last_otp_sent = now
-    self.save()
-    return self.otp, None
-        # Reset window agar 1 hour se zyada ho gaya
+        now = timezone.now()
+        # Reset window if 1 hour passed
         if self.otp_window_start:
             diff = (now - self.otp_window_start).total_seconds()
             if diff > 3600:
@@ -98,14 +73,15 @@ class User(AbstractBaseUser, PermissionsMixin):
         if self.otp_count >= 3:
             return None, 'OTP limit reached. Try after 1 hour.'
 
-        # 30 sec gap
+        # 30 sec cooldown between requests
         if self.last_otp_sent:
             gap = (now - self.last_otp_sent).total_seconds()
             if gap < 30:
-                return None, f'Wait {int(30 - gap)} seconds'
+                return None, f'Wait {int(30 - gap)} seconds before requesting again'
 
+        # Generate new OTP (valid for 5 minutes)
         self.otp = str(random.randint(100000, 999999))
-        self.otp_expires = now + timezone.timedelta(minutes=40)
+        self.otp_expires = now + timezone.timedelta(minutes=5)
         self.otp_count += 1
         self.last_otp_sent = now
         self.save()
