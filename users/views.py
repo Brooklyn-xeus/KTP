@@ -581,3 +581,25 @@ def driver_upload_selfie(request):
         logger.error(f"Selfie upload error: {e}")
         sentry_sdk.capture_exception(e)
         return server_error('Upload failed')
+        # Firebase verify mein timeout add karo
+decoded = firebase_auth.verify_id_token(
+    firebase_token,
+    clock_skew_seconds=10
+)
+
+# Supabase upload mein timeout
+response = req.post(
+    f'{supabase_url}/storage/v1/object/{bucket}/{file_path}',
+    headers={...},
+    data=buffer.getvalue(),
+    timeout=10  # ← ADD
+)
+img_hash = hashlib.md5(buffer.getvalue()).hexdigest()
+
+# Check duplicate
+if User.objects.filter(
+    selfie_hash=img_hash
+).exclude(id=user.id).exists():
+    return error('Duplicate selfie detected')
+
+user.selfie_hash = img_hash

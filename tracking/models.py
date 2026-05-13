@@ -144,3 +144,25 @@ class StopArrival(models.Model):
 
     def __str__(self):
         return f"Trip {self.trip.id} arrived at {self.stop.name}"
+       
+class BusLocation(models.Model):
+    # existing fields...
+    class Meta:
+        indexes = [
+            models.Index(fields=['last_updated']),
+        ]
+
+class Trip(models.Model):
+    # existing fields...
+    class Meta:
+        indexes = [
+            models.Index(fields=['driver', 'status']),
+            models.Index(fields=['status', 'start_time']),
+        ]
+
+class PassengerWaiting(models.Model):
+    # existing fields...
+    class Meta:
+        indexes = [
+            models.Index(fields=['route', 'got_bus']),
+        ]

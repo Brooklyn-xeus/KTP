@@ -70,4 +70,5 @@ path('admin/drivers/', views.admin_drivers),
 path('admin/verify-driver/', views.admin_verify_driver),
 path('admin/trips/', views.admin_active_trips),
 path('admin/emergencies/', views.admin_emergency_alerts),
+path('health/', views.health_check),
 ]

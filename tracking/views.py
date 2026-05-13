@@ -1588,3 +1588,79 @@ def admin_emergency_alerts(request):
             'resolved': a.resolved,
         } for a in alerts]
     })
+  
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def get_routes(request):
+    cached = cache.get('all_routes')
+    if cached:
+        return success(cached)
+
+    routes = Route.objects.all()
+    data = {
+        'routes': [{
+            'id': r.id,
+            'name': r.name,
+            'start': r.start_point,
+            'end': r.end_point
+        } for r in routes]
+    }
+    cache.set('all_routes', data, timeout=3600)  # 1 hour
+    return success(data)
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def stops_autocomplete(request):
+    q = request.query_params.get('q', '').strip()
+    if not q:
+        return error('Query required')
+
+    cache_key = f'stops_{q.lower()}'
+    cached = cache.get(cache_key)
+    if cached:
+        return success(cached)
+
+    stops = Stop.objects.filter(name__icontains=q)[:10]
+    data = {
+        'stops': [{
+            'id': s.id,
+            'name': s.name,
+            'lat': s.lat,
+            'lng': s.lng
+        } for s in stops]
+    }
+    cache.set(cache_key, data, timeout=1800)  # 30 min
+    return success(data)
+    
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def health_check(request):
+    import time
+    start = time.time()
+
+    checks = {}
+
+    # DB check
+    try:
+        from django.db import connection
+        connection.ensure_connection()
+        checks['database'] = 'ok'
+    except Exception as e:
+        checks['database'] = f'error: {str(e)}'
+
+    # Redis check
+    try:
+        cache.set('health_ping', 'pong', timeout=5)
+        val = cache.get('health_ping')
+        checks['redis'] = 'ok' if val == 'pong' else 'error'
+    except Exception as e:
+        checks['redis'] = f'error: {str(e)}'
+
+    checks['response_ms'] = round((time.time() - start) * 1000)
+
+    all_ok = all(v == 'ok' for k, v in checks.items() if k != 'response_ms')
+
+    return Response({
+        'status': 'healthy' if all_ok else 'degraded',
+        'checks': checks,
+    }, status=200 if all_ok else 503)

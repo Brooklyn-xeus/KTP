@@ -116,3 +116,5 @@ class OTPAttemptLog(models.Model):
 
     def __str__(self):
         return f"{self.phone} — {'✓' if self.success else '✗'} @ {self.attempted_at}"
+  
+selfie_hash = models.CharField(max_length=64, blank=True, null=True)
