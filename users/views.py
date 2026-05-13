@@ -1,4 +1,4 @@
-from rest_framework.decorators import api_view, permission_classes
+4from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -9,6 +9,11 @@ from .models import User, RefreshTokenStore, OTPAttemptLog
 import uuid
 import logging
 import sentry_sdk
+from PIL import Image
+from decouple import config
+import io
+import hashlib
+import requests as req
 
 logger = logging.getLogger(__name__)
 
@@ -514,7 +519,6 @@ def create_admin(request):
     return success({'message': 'Already exists'})
 
 # ─── DRIVER SELFIE ─────────────────────────────────────────
-
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def driver_upload_selfie(request):
@@ -537,17 +541,17 @@ def driver_upload_selfie(request):
         return error('Only JPEG, PNG, WebP allowed')
 
     try:
-        from PIL import Image
-        from decouple import config
-        import io
-        import requests as req
-
         img = Image.open(selfie)
         img = img.convert('RGB')
         img.thumbnail((400, 400))
         buffer = io.BytesIO()
         img.save(buffer, format='WebP', quality=80)
         buffer.seek(0)
+
+        # Duplicate check
+        img_hash = hashlib.md5(buffer.getvalue()).hexdigest()
+        if User.objects.filter(selfie_hash=img_hash).exclude(id=user.id).exists():
+            return error('Duplicate selfie detected')
 
         supabase_url = config('SUPABASE_URL')
         supabase_key = config('SUPABASE_KEY')
@@ -556,7 +560,8 @@ def driver_upload_selfie(request):
 
         req.delete(
             f'{supabase_url}/storage/v1/object/{bucket}/{file_path}',
-            headers={'Authorization': f'Bearer {supabase_key}'}
+            headers={'Authorization': f'Bearer {supabase_key}'},
+            timeout=10
         )
 
         response = req.post(
@@ -565,7 +570,8 @@ def driver_upload_selfie(request):
                 'Authorization': f'Bearer {supabase_key}',
                 'Content-Type': 'image/webp',
             },
-            data=buffer.getvalue()
+            data=buffer.getvalue(),
+            timeout=10
         )
 
         if response.status_code not in [200, 201]:
@@ -573,6 +579,7 @@ def driver_upload_selfie(request):
 
         public_url = f'{supabase_url}/storage/v1/object/public/{bucket}/{file_path}'
         user.selfie_url = public_url
+        user.selfie_hash = img_hash
         user.save()
 
         return success({'message': 'Selfie uploaded', 'selfie_url': public_url})
@@ -581,25 +588,3 @@ def driver_upload_selfie(request):
         logger.error(f"Selfie upload error: {e}")
         sentry_sdk.capture_exception(e)
         return server_error('Upload failed')
-        # Firebase verify mein timeout add karo
-decoded = firebase_auth.verify_id_token(
-    firebase_token,
-    clock_skew_seconds=10
-)
-
-# Supabase upload mein timeout
-response = req.post(
-    f'{supabase_url}/storage/v1/object/{bucket}/{file_path}',
-    headers={...},
-    data=buffer.getvalue(),
-    timeout=10  # ← ADD
-)
-img_hash = hashlib.md5(buffer.getvalue()).hexdigest()
-
-# Check duplicate
-if User.objects.filter(
-    selfie_hash=img_hash
-).exclude(id=user.id).exists():
-    return error('Duplicate selfie detected')
-
-user.selfie_hash = img_hash
