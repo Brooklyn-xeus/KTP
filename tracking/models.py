@@ -20,6 +20,12 @@ class Trip(models.Model):
     is_paused = models.BooleanField(default=False)
     passenger_count = models.IntegerField(default=0)
 
+    class Meta:
+        indexes = [
+            models.Index(fields=['driver', 'status']),
+            models.Index(fields=['status', 'start_time']),
+        ]
+
     def __str__(self):
         return f"Trip {self.id} — {self.driver.name} — {self.status}"
 
@@ -99,6 +105,7 @@ class DriverFrequentRoute(models.Model):
     class Meta:
         unique_together = ['driver', 'route']
         ordering = ['-usage_count']
+
 class UserRoutePreference(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='route_preference')
     from_stop = models.ForeignKey(Stop, on_delete=models.CASCADE, related_name='pref_from')
@@ -114,6 +121,7 @@ class StaleTrip(models.Model):
 
     def __str__(self):
         return f"Stale: {self.trip}"
+
 class EmergencyAlert(models.Model):
     driver = models.ForeignKey(User, on_delete=models.CASCADE, related_name='emergencies')
     trip = models.ForeignKey(Trip, on_delete=models.CASCADE)
@@ -144,25 +152,3 @@ class StopArrival(models.Model):
 
     def __str__(self):
         return f"Trip {self.trip.id} arrived at {self.stop.name}"
-       
-class BusLocation(models.Model):
-    # existing fields...
-    class Meta:
-        indexes = [
-            models.Index(fields=['last_updated']),
-        ]
-
-class Trip(models.Model):
-    # existing fields...
-    class Meta:
-        indexes = [
-            models.Index(fields=['driver', 'status']),
-            models.Index(fields=['status', 'start_time']),
-        ]
-
-class PassengerWaiting(models.Model):
-    # existing fields...
-    class Meta:
-        indexes = [
-            models.Index(fields=['route', 'got_bus']),
-        ]
