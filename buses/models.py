@@ -46,13 +46,10 @@ class Bus(models.Model):
     def __str__(self):
         return f"{self.plate_number} — {self.route.name}"
         
-class Bus(models.Model):
-    # existing fields...
-    class Meta:
-        indexes = [
-            models.Index(fields=['is_active']),
-            models.Index(fields=['driver']),
-        ]
+class Meta:
+    indexes = [
+        models.Index(fields=['driver']),
+    ]
 
 class RouteStop(models.Model):
     # existing fields...
