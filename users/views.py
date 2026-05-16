@@ -316,6 +316,27 @@ def driver_verify_otp(request):
 
         logger.info(f"[{request_id}] Driver OTP verified: {phone} — pending admin approval")
 
+        # Auto create bus
+        try:
+            from buses.models import Bus, Route
+            route = Route.objects.first()
+            if route and user.bus_number:
+                bus, created = Bus.objects.get_or_create(
+                    plate_number=user.bus_number,
+                    defaults={
+                        'route': route,
+                        'driver': user,
+                        'is_active': False,
+                        'vehicle_type': user.vehicle_type or 'bus',
+                    }
+                )
+                if not created and bus.driver is None:
+                    bus.driver = user
+                    bus.vehicle_type = user.vehicle_type or 'bus'
+                    bus.save()
+        except Exception as e:
+            print(f"Bus error: {e}")
+
         return success({
             'message': 'Phone verified! Your documents are under review (24-48 hours). Contact support if needed.',
             'status': 'pending',
