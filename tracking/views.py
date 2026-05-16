@@ -63,96 +63,57 @@ def get_active_buses():
         return result
 
 # ─── PASSENGER APIs ────────────────────────────────────────
-
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def get_buses(request):
     lat = request.query_params.get('lat')
     lng = request.query_params.get('lng')
     radius_m = float(request.query_params.get('radius_m', 5000))
+    vehicle_type_filter = request.query_params.get('vehicle_type')  # 'bus' or 'sonu'
 
     buses = get_active_buses()
     result = []
 
     for bus in buses:
+        # Apply vehicle type filter if provided
+        if vehicle_type_filter and bus.vehicle_type != vehicle_type_filter:
+            continue
+
         loc = bus.location
-        for bus in buses:
-             loc = bus.location
-    
-    # Vehicle type filter
-    vehicle_type_filter = request.query_params.get('vehicle_type', None)
-    if vehicle_type_filter and bus.vehicle_type != vehicle_type_filter:
-        continue
-    
-    bus_data = {
-        'bus_id': bus.id,
-        'plate': bus.plate_number,
-        'vehicle_type': bus.vehicle_type,
-        'icon': '🚌' if bus.vehicle_type == 'bus' else '🚐',
-        'route': bus.route.name,
-        'route_id': bus.route.id,
-        'start': bus.route.start_point,
-        'end': bus.route.end_point,
-        'lat': loc.lat,
-        'lng': loc.lng,
-        'driver_name': bus.driver.name if bus.driver else 'Unknown',
-        'is_verified': bus.driver.is_approved if bus.driver else False,
-        'is_paused': False,
-        'last_updated': loc.last_updated.isoformat(),
-    }
-    
+        bus_data = {
+            'bus_id': bus.id,
+            'plate': bus.plate_number,
+            'vehicle_type': bus.vehicle_type,
+            'icon': '🚌' if bus.vehicle_type == 'bus' else '🚐',
+            'route': bus.route.name,
+            'route_id': bus.route.id,
+            'start': bus.route.start_point,
+            'end': bus.route.end_point,
+            'lat': loc.lat,
+            'lng': loc.lng,
+            'driver_name': bus.driver.name if bus.driver else 'Unknown',
+            'is_verified': bus.driver.is_approved if bus.driver else False,
+            'is_paused': False,
+            'last_updated': loc.last_updated.isoformat(),
+        }
 
-
-     if lat and lng:
-          bus_data['distance_m'] = round(dist)
-          bus_data['eta_minutes'] = estimate_eta( loc.lat, loc.lng, float(lat), float(lng)
-          )
-          except (ValueError, TypeError):
+        # Add distance & ETA if user provided coordinates
+        if lat and lng:
+            try:
+                dist = calculate_distance(float(lat), float(lng), loc.lat, loc.lng)
+                if dist > radius_m:
+                    continue
+                bus_data['distance_m'] = round(dist)
+                bus_data['eta_minutes'] = estimate_eta(
+                    loc.lat, loc.lng, float(lat), float(lng)
+                )
+            except (ValueError, TypeError):
                 pass
 
-        result.append(bus_data)  # ← YAHI MISSING THA
+        result.append(bus_data)
 
     return success({'buses': result, 'count': len(result)})
-    vehicle_type = request.query_params.get('vehicle_type', None)
-    if vehicle_type and bus.vehicle_type != vehicle_type:
-        continue         
-@api_view(['GET'])
-@permission_classes([AllowAny])
-def get_bus_detail(request, bus_id):
-    try:
-        bus = Bus.objects.select_related(
-            'location', 'route', 'driver'
-        ).get(id=bus_id, is_active=True)
-    except Bus.DoesNotExist:
-        return error('Bus not found', 404)
-
-    try:
-        loc = bus.location
-    except BusLocation.DoesNotExist:
-        return error('Location not available', 404)
-
-    stops = RouteStop.objects.filter(
-        route=bus.route
-    ).select_related('stop').order_by('order')
-
-    return success({
-        'bus_id': bus.id,
-        'plate': bus.plate_number,
-        'route': bus.route.name,
-        'start': bus.route.start_point,
-        'end': bus.route.end_point,
-        'driver_name': bus.driver.name if bus.driver else 'Unknown',
-        'stops': [{
-            'id': rs.stop.id,
-            'name': rs.stop.name,
-            'lat': rs.stop.lat,
-            'lng': rs.stop.lng
-        } for rs in stops],
-        'lat': loc.lat,
-        'lng': loc.lng,
-        'last_updated': loc.last_updated.isoformat(),
-    })
-    
+   
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def search_buses(request):
