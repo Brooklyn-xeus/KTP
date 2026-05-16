@@ -60,7 +60,9 @@ def get_active_buses():
         if diff > 60:
             continue
         result.append(bus)
-    return result
+
+    b p
+    p    return result
 
 # ─── PASSENGER APIs ────────────────────────────────────────
 
@@ -89,6 +91,11 @@ def get_buses(request):
     'is_verified': bus.driver.is_approved if bus.driver else False,  # ← Blue tick
     'is_paused': False,
     'last_updated': loc.last_updated.isoformat(),
+    'bus_id': bus.id,
+    'plate': bus.plate_number,
+    'vehicle_type': bus.vehicle_type,  # ← ADD
+    'icon': '🚌' if bus.vehicle_type == 'bus' else '🚐',  # ← ADD
+    'route': bus.route.name,
 }
 
         if lat and lng:
@@ -106,8 +113,10 @@ def get_buses(request):
         result.append(bus_data)  # ← YAHI MISSING THA
 
     return success({'buses': result, 'count': len(result)})
-    
- 
+    vehicle_type = request.query_params.get('vehicle_type', None)
+    if vehicle_type and bus.vehicle_type != vehicle_type:
+        continue
+         
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def get_bus_detail(request, bus_id):
@@ -1664,3 +1673,13 @@ def health_check(request):
         'status': 'healthy' if all_ok else 'degraded',
         'checks': checks,
     }, status=200 if all_ok else 503)
+    
+Bus.objects.get_or_create(
+    plate_number=user.bus_number,
+    defaults={
+        'route': route,
+        'driver': user,
+        'is_active': False,
+        'vehicle_type': user.vehicle_type,  # ← ADD
+    }
+)

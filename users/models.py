@@ -118,3 +118,14 @@ class OTPAttemptLog(models.Model):
         return f"{self.phone} — {'✓' if self.success else '✗'} @ {self.attempted_at}"
   
 selfie_hash = models.CharField(max_length=64, blank=True, null=True)
+
+VEHICLE_TYPES = [
+    ('bus', 'Bus'),
+    ('sonu', 'Sonu/Sumo'),
+]
+vehicle_type = models.CharField(
+    max_length=10, 
+    choices=VEHICLE_TYPES, 
+    default='bus',
+    blank=True, null=True
+)

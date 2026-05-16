@@ -183,14 +183,20 @@ def google_login(request):
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def driver_register(request):
-    request_id = str(uuid.uuid4())[:8]
-    phone = request.data.get('phone', '').strip()
-    name = request.data.get('name', '').strip()
-    pin = request.data.get('pin', '').strip()
-    license_no = request.data.get('license_no', '').strip()
-    rc_number = request.data.get('rc_number', '').strip()
-    bus_number = request.data.get('bus_number', '').strip()
-    ip = get_client_ip(request)
+    vehicle_type = request.data.get('vehicle_type', 'bus').strip()
+    if vehicle_type not in ['bus', 'sonu']:
+        return error('vehicle_type must be bus or sonu')
+        user.vehicle_type = vehicle_type
+        user.save()
+        request_id = str(uuid.uuid4())[:8]
+        phone = request.data.get('phone', '').strip()
+        name = request.data.get('name', '').strip()
+        pin = request.data.get('pin', '').strip()
+        license_no = request.data.get('license_no', '').strip()
+        rc_number = request.data.get('rc_number', '').strip()
+        bus_number = request.data.get('bus_number', '').strip()
+        ip = get_client_ip(request)
+        
 
     # Validate
     if not all([phone, name, pin, license_no, bus_number]):

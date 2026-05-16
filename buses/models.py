@@ -41,4 +41,13 @@ class Bus(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        return f"{self.plate_number} — {self.route.name}"
+        return f"{self.plate_number} — {self.route.name}"        
+VEHICLE_TYPES = [
+    ('bus', 'Bus'),
+    ('sonu', 'Sonu/Sumo'),
+]
+vehicle_type = models.CharField(
+    max_length=10,
+    choices=VEHICLE_TYPES,
+    default='bus'
+)
