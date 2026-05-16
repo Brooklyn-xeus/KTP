@@ -1,22 +1,26 @@
-from .models import UserRoutePreference, StaleTrip
+# views.py - Fully corrected version
+import math
+from datetime import datetime
+
+from django.core.cache import cache
+from django.db import connection
+from django.db.models import Q
+from django.utils import timezone
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
-from django.core.cache import cache
-from django.utils import timezone
-from django.db.models import Q
-import math
-from .models import EmergencyAlert, PassengerCountLog, StopArrival
-from django.utils import timezone
-import math
-from django.core.cache import cache
-from .models import EmergencyAlert
-from .models import (BusLocation, PassengerWaiting, Subscription,
-                     NotificationLog, Trip, LocationSharingSession,
-                     DriverFrequentRoute)
-from buses.models import Bus, Route, Stop, RouteStop
-import math
 
+from .firebase import send_bulk_notification
+from .models import (
+    EmergencyAlert, PassengerCountLog, StopArrival, UserRoutePreference,
+    StaleTrip, BusLocation, PassengerWaiting, Subscription, NotificationLog,
+    Trip, LocationSharingSession, DriverFrequentRoute
+)
+from buses.models import Bus, Route, Stop, RouteStop
+from users.models import User as UserModel
+
+
+# ========== HELPERS ==========
 def success(data):
     return Response({'success': True, 'data': data})
 
@@ -24,7 +28,8 @@ def error(msg, status=400):
     return Response({'success': False, 'message': msg}, status=status)
 
 def validate_coordinates(lat, lng):
-    return 20 <= lat <= 40 and 60 <= lng <= 85
+    # Kashmir bounds (approx)
+    return 32.5 <= float(lat) <= 35.5 and 73.5 <= float(lng) <= 80.5
 
 def calculate_distance(lat1, lng1, lat2, lng2):
     R = 6371000
@@ -41,6 +46,11 @@ def estimate_eta(bus_lat, bus_lng, stop_lat, stop_lng, speed_kmh=30):
     speed_ms = speed_kmh * 1000 / 3600
     eta_seconds = distance / speed_ms if speed_ms > 0 else 0
     return round(eta_seconds / 60)
+
+def mask_coordinates(lat, lng, precision=0.001):
+    masked_lat = round(round(lat / precision) * precision, 6)
+    masked_lng = round(round(lng / precision) * precision, 6)
+    return masked_lat, masked_lng
 
 def get_active_buses():
     now = timezone.now()
@@ -60,22 +70,55 @@ def get_active_buses():
         if diff > 60:
             continue
         result.append(bus)
-        return result
+    return result
 
-# ─── PASSENGER APIs ────────────────────────────────────────
+def check_stale_trips():
+    now = timezone.now()
+    active_trips = Trip.objects.filter(status='active')
+    for trip in active_trips:
+        try:
+            loc = trip.bus.location
+            diff = (now - loc.last_updated).total_seconds()
+            if diff > 30:
+                trip.status = 'stale'
+                trip.save()
+                trip.bus.is_active = False
+                trip.bus.save()
+        except BusLocation.DoesNotExist:
+            pass
+
+def detect_gps_jump(prev_lat, prev_lng, new_lat, new_lng, seconds_elapsed):
+    if not all([prev_lat, prev_lng]):
+        return False
+    distance = calculate_distance(prev_lat, prev_lng, new_lat, new_lng)
+    max_distance = (80 * 1000 / 3600) * seconds_elapsed * 2
+    return distance > max_distance and distance > 500
+
+def check_waiting_spam(user_id):
+    key = f'waiting_spam_{user_id}'
+    count = cache.get(key, 0)
+    if count >= 10:
+        return True
+    cache.set(key, count + 1, timeout=3600)
+    return False
+
+def log_suspicious(user, action, detail):
+    print(f"🚨 SUSPICIOUS: User {user.id} ({user.name}) — {action}: {detail}")
+
+
+# ========== PASSENGER APIs ==========
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def get_buses(request):
     lat = request.query_params.get('lat')
     lng = request.query_params.get('lng')
     radius_m = float(request.query_params.get('radius_m', 5000))
-    vehicle_type_filter = request.query_params.get('vehicle_type')  # 'bus' or 'sonu'
+    vehicle_type_filter = request.query_params.get('vehicle_type')
 
     buses = get_active_buses()
     result = []
 
     for bus in buses:
-        # Apply vehicle type filter if provided
         if vehicle_type_filter and bus.vehicle_type != vehicle_type_filter:
             continue
 
@@ -97,23 +140,20 @@ def get_buses(request):
             'last_updated': loc.last_updated.isoformat(),
         }
 
-        # Add distance & ETA if user provided coordinates
         if lat and lng:
             try:
                 dist = calculate_distance(float(lat), float(lng), loc.lat, loc.lng)
                 if dist > radius_m:
                     continue
                 bus_data['distance_m'] = round(dist)
-                bus_data['eta_minutes'] = estimate_eta(
-                    loc.lat, loc.lng, float(lat), float(lng)
-                )
+                bus_data['eta_minutes'] = estimate_eta(loc.lat, loc.lng, float(lat), float(lng))
             except (ValueError, TypeError):
                 pass
 
         result.append(bus_data)
 
     return success({'buses': result, 'count': len(result)})
-   
+
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def search_buses(request):
@@ -158,9 +198,7 @@ def search_buses(request):
 
         if bus.route.id in valid_routes:
             if user_lat and user_lng:
-                bus_data['eta_minutes'] = estimate_eta(
-                    loc.lat, loc.lng, from_stop.lat, from_stop.lng
-                )
+                bus_data['eta_minutes'] = estimate_eta(loc.lat, loc.lng, from_stop.lat, from_stop.lng)
             matched.append(bus_data)
         elif user_lat and user_lng:
             try:
@@ -185,21 +223,34 @@ def stops_autocomplete(request):
     if not q:
         return error('Query required')
 
+    cache_key = f'stops_{q.lower()}'
+    cached = cache.get(cache_key)
+    if cached:
+        return success(cached)
+
     stops = Stop.objects.filter(name__icontains=q)[:10]
-    return success({
+    data = {
         'stops': [{'id': s.id, 'name': s.name, 'lat': s.lat, 'lng': s.lng} for s in stops]
-    })
+    }
+    cache.set(cache_key, data, timeout=1800)
+    return success(data)
 
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def get_routes(request):
+    cached = cache.get('all_routes')
+    if cached:
+        return success(cached)
+
     routes = Route.objects.all()
-    return success({
+    data = {
         'routes': [{'id': r.id, 'name': r.name, 'start': r.start_point, 'end': r.end_point} for r in routes]
-    })
+    }
+    cache.set('all_routes', data, timeout=3600)
+    return success(data)
 
-# ─── LOCATION SHARING ──────────────────────────────────────
 
+# ========== LOCATION SHARING ==========
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def share_location_start(request):
@@ -226,7 +277,6 @@ def share_location_start(request):
         lat=float(lat),
         lng=float(lng),
     )
-
     return success({'session_id': session.id})
 
 @api_view(['POST'])
@@ -244,7 +294,6 @@ def share_location_update(request):
     session.lat = float(lat)
     session.lng = float(lng)
     session.save()
-
     return success({'message': 'Location updated'})
 
 @api_view(['POST'])
@@ -260,8 +309,8 @@ def share_location_stop(request):
     except LocationSharingSession.DoesNotExist:
         return error('Session not found', 404)
 
-# ─── WAITING ───────────────────────────────────────────────
 
+# ========== WAITING ==========
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def mark_waiting(request):
@@ -290,7 +339,6 @@ def mark_waiting(request):
         from_stop_id=from_stop_id,
         to_stop_id=to_stop_id,
     )
-
     return success({'message': 'Marked as waiting', 'id': waiting.id})
 
 @api_view(['POST'])
@@ -299,23 +347,13 @@ def got_bus(request):
     PassengerWaiting.objects.filter(user=request.user, got_bus=False).update(got_bus=True)
     return success({'message': 'Marked as got bus'})
 
-def mask_coordinates(lat, lng, precision=0.001):
-    """
-    Grid masking — ~100 meter precision
-    Rounds to nearest grid point
-    """
-    masked_lat = round(round(lat / precision) * precision, 6)
-    masked_lng = round(round(lng / precision) * precision, 6)
-    return masked_lat, masked_lng
-
 @api_view(['GET'])
-@permission_classes([IsAuthenticated])  # Now requires auth
+@permission_classes([IsAuthenticated])
 def get_waiting_passengers(request, route_id):
     waiting = PassengerWaiting.objects.filter(
         route_id=route_id, got_bus=False
     ).values('lat', 'lng', 'from_stop__name', 'to_stop__name')
 
-    # Mask coordinates
     masked = []
     for p in waiting:
         mlat, mlng = mask_coordinates(p['lat'], p['lng'])
@@ -325,11 +363,10 @@ def get_waiting_passengers(request, route_id):
             'from_stop': p['from_stop__name'],
             'to_stop': p['to_stop__name'],
         })
-
     return success({'passengers': masked})
 
-# ─── SUBSCRIBE ─────────────────────────────────────────────
 
+# ========== SUBSCRIPTIONS ==========
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def subscribe_route(request):
@@ -356,11 +393,9 @@ def subscribe_route(request):
             'to_stop_id': to_stop_id,
         }
     )
-
     if not created:
         sub.is_active = True
         sub.save()
-
     return success({'message': f'Subscribed to {route.name} ({time_window})', 'id': sub.id})
 
 @api_view(['GET'])
@@ -386,33 +421,28 @@ def unsubscribe_route(request, sub_id):
     except Subscription.DoesNotExist:
         return error('Subscription not found', 404)
 
-# ─── DRIVER APIs ───────────────────────────────────────────
+
+# ========== DRIVER APIs ==========
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def driver_profile(request):
     user = request.user
-
     if not user.is_driver:
         return error('Not a driver')
 
-    # Bus dhundho — user.bus se ya bus_number se
     bus = None
     try:
         bus = user.bus
     except Exception:
         pass
 
-    # Agar user.bus nahi mila toh bus_number se dhundho
     if not bus and user.bus_number:
         from buses.models import Bus as BusModel
         try:
             bus = BusModel.objects.get(plate_number=user.bus_number)
-            # Assign kar do
             bus.driver = user
             bus.save()
         except BusModel.DoesNotExist:
-            # Bus exist nahi karta — banao
-            from buses.models import Route
             route = Route.objects.first()
             if route:
                 bus = BusModel.objects.create(
@@ -425,9 +455,7 @@ def driver_profile(request):
     if not bus:
         return error('No bus assigned. Contact admin.')
 
-    active_trip = Trip.objects.filter(
-        driver=user, status__in=['active', 'paused']
-    ).first()
+    active_trip = Trip.objects.filter(driver=user, status__in=['active', 'paused']).first()
 
     return success({
         'name': user.name,
@@ -449,30 +477,20 @@ def driver_profile(request):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def driver_routes(request):
+    """Return the driver's assigned route (no copy-paste mistakes)"""
     user = request.user
     if not user.is_driver:
         return error('Not a driver')
 
     try:
         bus = user.bus
-        frequent = DriverFrequentRoute.objects.filter(driver=user).values_list('route_id', flat=True)
-        route = bus.route
         return success({
-    'name': user.name,
-    'phone': user.phone,
-    'bus_number': bus.plate_number,
-    'license_no': user.license_no,
-    'is_approved': user.is_approved,
-    'is_verified': user.is_approved,  # Blue tick
-    'trip_status': active_trip.status if active_trip else 'inactive',
-    'trip_id': active_trip.id if active_trip else None,
-    'route': {
-        'id': bus.route.id,
-        'name': bus.route.name,
-        'start': bus.route.start_point,
-        'end': bus.route.end_point,
-    }
-})
+            'route_id': bus.route.id,
+            'route_name': bus.route.name,
+            'start': bus.route.start_point,
+            'end': bus.route.end_point,
+            'stops': list(bus.route.stops.values('id', 'name', 'lat', 'lng'))
+        })
     except Bus.DoesNotExist:
         return error('No bus assigned')
 
@@ -679,8 +697,9 @@ def trip_summary(request):
         'duration_minutes': duration,
         'passenger_count': trip.passenger_count,
     })
-# ─── PHASE 2 — USER PREFERENCES ───────────────────────────
 
+
+# ========== PHASE 2 – USER PREFERENCES ==========
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def save_route_preference(request):
@@ -719,8 +738,8 @@ def get_route_preference(request):
     except UserRoutePreference.DoesNotExist:
         return success({'from_stop': None, 'to_stop': None})
 
-# ─── PHASE 2 — STALE TRIP DETECTION ───────────────────────
 
+# ========== PHASE 2 – STALE TRIP ==========
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def force_refresh(request):
@@ -731,23 +750,8 @@ def force_refresh(request):
     except Trip.DoesNotExist:
         return error('Trip not found', 404)
 
-def check_stale_trips():
-    now = timezone.now()
-    active_trips = Trip.objects.filter(status='active')
-    for trip in active_trips:
-        try:
-            loc = trip.bus.location
-            diff = (now - loc.last_updated).total_seconds()
-            if diff > 30:
-                trip.status = 'stale'
-                trip.save()
-                trip.bus.is_active = False
-                trip.bus.save()
-        except BusLocation.DoesNotExist:
-            pass
 
-# ─── PHASE 2 — SUBSCRIBE WITH DAILY TIME ──────────────────
-
+# ========== PHASE 2 – SUBSCRIBE WITH TIME ==========
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def subscribe_with_time(request):
@@ -761,7 +765,6 @@ def subscribe_with_time(request):
         return error('route_id and daily_time required')
 
     try:
-        from datetime import datetime
         time_obj = datetime.strptime(daily_time, '%H:%M').time()
     except ValueError:
         return error('daily_time format must be HH:MM')
@@ -789,8 +792,8 @@ def subscribe_with_time(request):
         'daily_time': daily_time,
     })
 
-# ─── PHASE 3 — NOTIFICATION TRIGGER ──────────────────────
 
+# ========== PHASE 3 – NOTIFICATIONS ==========
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def trigger_notifications(request):
@@ -803,7 +806,6 @@ def trigger_notifications(request):
     except Bus.DoesNotExist:
         return error('Bus not found', 404)
 
-    from .firebase import send_bulk_notification
     now = timezone.now()
     hour = now.hour
     current_window = 'AM' if 5 <= hour <= 12 else 'PM'
@@ -847,8 +849,8 @@ def trigger_notifications(request):
 
     return success({'message': f'Notified {len(tokens)} users'})
 
-# ─── PHASE 3 — DRIVER VERIFIED BADGE ─────────────────────
 
+# ========== PHASE 3 – DRIVER BADGE ==========
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def driver_badge(request):
@@ -861,8 +863,8 @@ def driver_badge(request):
         'badge_color': '#2196F3' if user.is_approved else '#9E9E9E',
     })
 
-# ─── PHASE 3 — TRIP COMPRESSED SUMMARY ───────────────────
 
+# ========== PHASE 3 – TRIP HISTORY ==========
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def trip_history(request):
@@ -883,36 +885,34 @@ def trip_history(request):
         } for t in trips]
     })
 
-# ─── PHASE 3 — ADMIN STATS ────────────────────────────────
 
+# ========== PHASE 3 – ADMIN STATS ==========
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def admin_stats(request):
     if not request.user.is_staff:
         return error('Admin only', 403)
 
-    from users.models import User
     return success({
-        'total_users': User.objects.count(),
-        'total_drivers': User.objects.filter(is_driver=True).count(),
-        'approved_drivers': User.objects.filter(is_driver=True, is_approved=True).count(),
+        'total_users': UserModel.objects.count(),
+        'total_drivers': UserModel.objects.filter(is_driver=True).count(),
+        'approved_drivers': UserModel.objects.filter(is_driver=True, is_approved=True).count(),
         'active_buses': Bus.objects.filter(is_active=True).count(),
         'total_trips_today': Trip.objects.filter(
             start_time__date=timezone.now().date()
         ).count(),
         'active_sharing_sessions': LocationSharingSession.objects.filter(is_active=True).count(),
     })
-# ─── EMERGENCY ALERT ───────────────────────────────────────
 
+
+# ========== EMERGENCY ALERT ==========
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def emergency_alert(request):
     user = request.user
-
     if not user.is_driver:
         return error('Not a driver')
 
-    # Rate limit — 1 emergency per 5 minutes
     cache_key = f'emergency_{user.id}'
     if cache.get(cache_key):
         return error('Emergency already sent. Wait 5 minutes.', 429)
@@ -944,14 +944,9 @@ def emergency_alert(request):
         longitude=lng,
     )
 
-    # Rate limit set karo
     cache.set(cache_key, True, timeout=300)
-
-    # Admin ko notify karo
     print(f"🚨 EMERGENCY ALERT — Driver: {user.name} | Trip: {trip.id} | Location: {lat},{lng}")
 
-    # FCM notification to admins
-    from users.models import User as UserModel
     admin_tokens = list(
         UserModel.objects.filter(
             is_staff=True,
@@ -961,7 +956,6 @@ def emergency_alert(request):
 
     if admin_tokens:
         try:
-            from .firebase import send_bulk_notification
             send_bulk_notification(
                 tokens=admin_tokens,
                 title='🚨 Emergency Alert!',
@@ -983,13 +977,12 @@ def emergency_alert(request):
         'location': {'lat': lat, 'lng': lng},
     })
 
-# ─── PASSENGER COUNT UPDATE ────────────────────────────────
 
+# ========== PASSENGER COUNT ==========
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def update_passenger_count(request):
     user = request.user
-
     if not user.is_driver:
         return error('Not a driver')
 
@@ -998,7 +991,6 @@ def update_passenger_count(request):
 
     if count is None:
         return error('count required')
-
     try:
         count = int(count)
         if count < 0:
@@ -1013,23 +1005,16 @@ def update_passenger_count(request):
 
     trip.passenger_count = count
     trip.save()
-
-    # Log karo for analytics
     PassengerCountLog.objects.create(trip=trip, count=count)
 
-    return success({
-        'count': count,
-        'trip_id': trip.id,
-        'message': 'Passenger count updated',
-    })
+    return success({'count': count, 'trip_id': trip.id, 'message': 'Passenger count updated'})
 
-# ─── ARRIVAL CONFIRMATION ──────────────────────────────────
 
+# ========== ARRIVAL CONFIRMATION ==========
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def confirm_arrival(request):
     user = request.user
-
     if not user.is_driver:
         return error('Not a driver')
 
@@ -1051,17 +1036,13 @@ def confirm_arrival(request):
     except Stop.DoesNotExist:
         return error('Stop not found', 404)
 
-    # Stop belongs to route check
     if not RouteStop.objects.filter(route=trip.route, stop=stop).exists():
         return error('Stop not on this route', 400)
 
-    # Arrival mark karo
     arrival, created = StopArrival.objects.get_or_create(trip=trip, stop=stop)
-
     if not created:
         return error('Already confirmed arrival at this stop', 400)
 
-    # Next stops calculate karo
     current_order = RouteStop.objects.get(route=trip.route, stop=stop).order
     next_route_stops = RouteStop.objects.filter(
         route=trip.route,
@@ -1076,7 +1057,6 @@ def confirm_arrival(request):
             eta = estimate_eta(loc.lat, loc.lng, rs.stop.lat, rs.stop.lng)
         except Exception:
             pass
-
         next_stops.append({
             'stop_id': rs.stop.id,
             'name': rs.stop.name,
@@ -1086,7 +1066,6 @@ def confirm_arrival(request):
             'eta_minutes': eta,
         })
 
-    # Notify subscribers at this stop
     subs = Subscription.objects.filter(
         from_stop=stop,
         is_active=True,
@@ -1096,7 +1075,6 @@ def confirm_arrival(request):
     tokens = [s.user.fcm_token for s in subs if s.user.fcm_token]
     if tokens:
         try:
-            from .firebase import send_bulk_notification
             send_bulk_notification(
                 tokens=tokens,
                 title=f'🚌 Bus arriving at {stop.name}',
@@ -1112,32 +1090,23 @@ def confirm_arrival(request):
         'next_stops': next_stops,
     })
 
-# ─── NEXT STOPS FOR TRIP ───────────────────────────────────
 
+# ========== NEXT STOPS ==========
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def next_stops(request):
     user = request.user
-
     if not user.is_driver:
         return error('Not a driver')
 
     trip_id = request.query_params.get('trip_id')
-
     try:
-        trip = Trip.objects.select_related('route').get(
-            id=trip_id, driver=user
-        )
+        trip = Trip.objects.select_related('route', 'bus').get(id=trip_id, driver=user)
     except Trip.DoesNotExist:
         return error('Trip not found', 404)
 
-    route_stops = RouteStop.objects.filter(
-        route=trip.route
-    ).select_related('stop').order_by('order')
-
-    arrived_stops = set(
-        StopArrival.objects.filter(trip=trip).values_list('stop_id', flat=True)
-    )
+    route_stops = RouteStop.objects.filter(route=trip.route).select_related('stop').order_by('order')
+    arrived_stops = set(StopArrival.objects.filter(trip=trip).values_list('stop_id', flat=True))
 
     last_arrived_order = 0
     for rs in route_stops:
@@ -1175,8 +1144,8 @@ def next_stops(request):
 
     return success({'stops': result})
 
-# ─── RESOLVE EMERGENCY ─────────────────────────────────────
 
+# ========== RESOLVE EMERGENCY (Admin) ==========
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def resolve_emergency(request):
@@ -1192,9 +1161,9 @@ def resolve_emergency(request):
         return success({'message': 'Emergency resolved'})
     except EmergencyAlert.DoesNotExist:
         return error('Alert not found', 404)
-        
-# ─── TRIP HISTORY ──────────────────────────────────────────
 
+
+# ========== TRIP HISTORIES (Driver & Passenger) ==========
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def driver_trip_history(request):
@@ -1202,10 +1171,7 @@ def driver_trip_history(request):
     if not user.is_driver:
         return error('Not a driver')
 
-    trips = Trip.objects.filter(
-        driver=user
-    ).order_by('-start_time')[:20]
-
+    trips = Trip.objects.filter(driver=user).order_by('-start_time')[:20]
     return success({
         'trips': [{
             'trip_id': t.id,
@@ -1224,10 +1190,7 @@ def driver_trip_history(request):
 @permission_classes([IsAuthenticated])
 def passenger_trip_history(request):
     user = request.user
-    sessions = LocationSharingSession.objects.filter(
-        user=user
-    ).order_by('-created_at')[:20]
-
+    sessions = LocationSharingSession.objects.filter(user=user).order_by('-created_at')[:20]
     return success({
         'trips': [{
             'id': s.id,
@@ -1239,37 +1202,8 @@ def passenger_trip_history(request):
         } for s in sessions]
     })
 
-# ─── FRAUD DETECTION ───────────────────────────────────────
 
-def detect_gps_jump(prev_lat, prev_lng, new_lat, new_lng, seconds_elapsed):
-    """
-    Detect unrealistic GPS jump
-    Max speed Kashmir roads = 80 km/h
-    """
-    if not all([prev_lat, prev_lng]):
-        return False
-
-    distance = calculate_distance(prev_lat, prev_lng, new_lat, new_lng)
-    max_distance = (80 * 1000 / 3600) * seconds_elapsed * 2  # 2x buffer
-
-    if distance > max_distance and distance > 500:
-        return True
-    return False
-
-def check_waiting_spam(user_id):
-    """Max 10 waiting requests per hour"""
-    key = f'waiting_spam_{user_id}'
-    count = cache.get(key, 0)
-    if count >= 10:
-        return True
-    cache.set(key, count + 1, timeout=3600)
-    return False
-
-def log_suspicious(user, action, detail):
-    print(f"🚨 SUSPICIOUS: User {user.id} ({user.name}) — {action}: {detail}")
-
-# ─── ENHANCED LOCATION UPDATE WITH FRAUD DETECTION ─────────
-
+# ========== SAFE LOCATION UPDATE (with fraud detection) ==========
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def update_location_safe(request):
@@ -1303,30 +1237,23 @@ def update_location_safe(request):
     if not validate_coordinates(lat, lng):
         return error('Coordinates out of Kashmir bounds')
 
-    # Fraud — GPS jump detection
+    # GPS jump detection
     try:
-        loc = bus.location
-        if loc.last_updated:
-            elapsed = (timezone.now() - loc.last_updated).total_seconds()
-            if detect_gps_jump(loc.lat, loc.lng, lat, lng, elapsed):
+        last_loc = bus.location
+        if last_loc and last_loc.last_updated:
+            elapsed = (timezone.now() - last_loc.last_updated).total_seconds()
+            if detect_gps_jump(last_loc.lat, last_loc.lng, lat, lng, elapsed):
                 log_suspicious(user, 'GPS_JUMP',
-                    f'From {loc.lat},{loc.lng} to {lat},{lng} in {elapsed}s')
+                    f'From {last_loc.lat},{last_loc.lng} to {lat},{lng} in {elapsed}s')
                 return error('Invalid GPS data detected. Please retry.')
     except BusLocation.DoesNotExist:
         pass
 
-    active_trip = Trip.objects.filter(
-        driver=user, status='active'
-    ).first()
+    active_trip = Trip.objects.filter(driver=user, status='active').first()
 
     BusLocation.objects.update_or_create(
         bus=bus,
-        defaults={
-            'lat': lat,
-            'lng': lng,
-            'speed': speed,
-            'trip': active_trip
-        }
+        defaults={'lat': lat, 'lng': lng, 'speed': speed, 'trip': active_trip}
     )
 
     cache_data = {
@@ -1342,14 +1269,13 @@ def update_location_safe(request):
 
     return success({'message': 'Location updated'})
 
-# ─── ENHANCED WAITING WITH SPAM CHECK ─────────────────────
 
+# ========== SAFE WAITING (spam check) ==========
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def mark_waiting_safe(request):
     user = request.user
 
-    # Spam check
     if check_waiting_spam(user.id):
         log_suspicious(user, 'WAITING_SPAM', 'Too many waiting requests')
         return error('Too many requests. Wait a while.', 429)
@@ -1384,8 +1310,8 @@ def mark_waiting_safe(request):
 
     return success({'message': 'Marked as waiting', 'id': waiting.id})
 
-# ─── DRIVER STATUS ─────────────────────────────────────────
 
+# ========== DRIVER STATUS (public) ==========
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def get_buses_with_status(request):
@@ -1409,7 +1335,6 @@ def get_buses_with_status(request):
             bus.save()
             continue
 
-        # Driver status
         if diff <= 30:
             driver_status = 'active'
         elif diff <= 60:
@@ -1418,11 +1343,7 @@ def get_buses_with_status(request):
             driver_status = 'offline'
             continue
 
-        # Check if paused
-        active_trip = Trip.objects.filter(
-            driver=bus.driver, status='paused'
-        ).first() if bus.driver else None
-
+        active_trip = Trip.objects.filter(driver=bus.driver, status='paused').first() if bus.driver else None
         if active_trip:
             driver_status = 'paused'
 
@@ -1449,9 +1370,7 @@ def get_buses_with_status(request):
                 if dist > radius_m:
                     continue
                 bus_data['distance_m'] = round(dist)
-                bus_data['eta_minutes'] = estimate_eta(
-                    loc.lat, loc.lng, float(lat), float(lng)
-                )
+                bus_data['eta_minutes'] = estimate_eta(loc.lat, loc.lng, float(lat), float(lng))
             except (ValueError, TypeError):
                 pass
 
@@ -1459,17 +1378,15 @@ def get_buses_with_status(request):
 
     return success({'buses': result, 'count': len(result)})
 
-# ─── ADMIN APIs ────────────────────────────────────────────
 
+# ========== ADMIN APIs ==========
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def admin_drivers(request):
     if not request.user.is_staff:
         return error('Admin only', 403)
 
-    from users.models import User as UserModel
     drivers = UserModel.objects.filter(is_driver=True).order_by('-created_at')
-
     return success({
         'drivers': [{
             'id': d.id,
@@ -1494,7 +1411,6 @@ def admin_verify_driver(request):
     driver_id = request.data.get('driver_id')
     action = request.data.get('action', 'verify')
 
-    from users.models import User as UserModel
     try:
         driver = UserModel.objects.get(id=driver_id, is_driver=True)
     except UserModel.DoesNotExist:
@@ -1542,10 +1458,7 @@ def admin_emergency_alerts(request):
     if not request.user.is_staff:
         return error('Admin only', 403)
 
-    alerts = EmergencyAlert.objects.filter(
-        resolved=False
-    ).select_related('driver', 'trip').order_by('-timestamp')
-
+    alerts = EmergencyAlert.objects.filter(resolved=False).select_related('driver', 'trip').order_by('-timestamp')
     return success({
         'alerts': [{
             'alert_id': a.id,
@@ -1557,67 +1470,22 @@ def admin_emergency_alerts(request):
             'resolved': a.resolved,
         } for a in alerts]
     })
-  
-@api_view(['GET'])
-@permission_classes([AllowAny])
-def get_routes(request):
-    cached = cache.get('all_routes')
-    if cached:
-        return success(cached)
 
-    routes = Route.objects.all()
-    data = {
-        'routes': [{
-            'id': r.id,
-            'name': r.name,
-            'start': r.start_point,
-            'end': r.end_point
-        } for r in routes]
-    }
-    cache.set('all_routes', data, timeout=3600)  # 1 hour
-    return success(data)
 
-@api_view(['GET'])
-@permission_classes([AllowAny])
-def stops_autocomplete(request):
-    q = request.query_params.get('q', '').strip()
-    if not q:
-        return error('Query required')
-
-    cache_key = f'stops_{q.lower()}'
-    cached = cache.get(cache_key)
-    if cached:
-        return success(cached)
-
-    stops = Stop.objects.filter(name__icontains=q)[:10]
-    data = {
-        'stops': [{
-            'id': s.id,
-            'name': s.name,
-            'lat': s.lat,
-            'lng': s.lng
-        } for s in stops]
-    }
-    cache.set(cache_key, data, timeout=1800)  # 30 min
-    return success(data)
-    
+# ========== HEALTH CHECK ==========
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def health_check(request):
     import time
     start = time.time()
-
     checks = {}
 
-    # DB check
     try:
-        from django.db import connection
         connection.ensure_connection()
         checks['database'] = 'ok'
     except Exception as e:
         checks['database'] = f'error: {str(e)}'
 
-    # Redis check
     try:
         cache.set('health_ping', 'pong', timeout=5)
         val = cache.get('health_ping')
@@ -1626,20 +1494,9 @@ def health_check(request):
         checks['redis'] = f'error: {str(e)}'
 
     checks['response_ms'] = round((time.time() - start) * 1000)
-
     all_ok = all(v == 'ok' for k, v in checks.items() if k != 'response_ms')
 
     return Response({
         'status': 'healthy' if all_ok else 'degraded',
         'checks': checks,
     }, status=200 if all_ok else 503)
-    
-Bus.objects.get_or_create(
-    plate_number=user.bus_number,
-    defaults={
-        'route': route,
-        'driver': user,
-        'is_active': False,
-        'vehicle_type': user.vehicle_type,  # ← ADD
-    }
-)
