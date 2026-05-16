@@ -100,15 +100,14 @@ def get_buses(request):
         'is_paused': False,
         'last_updated': loc.last_updated.isoformat(),
     }
+    
 
 
-        if lat and lng:
-          
-                bus_data['distance_m'] = round(dist)
-                bus_data['eta_minutes'] = estimate_eta(
-                    loc.lat, loc.lng, float(lat), float(lng)
-                )
-            except (ValueError, TypeError):
+     if lat and lng:
+          bus_data['distance_m'] = round(dist)
+          bus_data['eta_minutes'] = estimate_eta( loc.lat, loc.lng, float(lat), float(lng)
+          )
+          except (ValueError, TypeError):
                 pass
 
         result.append(bus_data)  # ← YAHI MISSING THA
