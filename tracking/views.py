@@ -77,7 +77,7 @@ def get_buses(request):
     for bus in buses:
         loc = bus.location
         for bus in buses:
-    loc = bus.location
+             loc = bus.location
     
     # Vehicle type filter
     vehicle_type_filter = request.query_params.get('vehicle_type', None)
