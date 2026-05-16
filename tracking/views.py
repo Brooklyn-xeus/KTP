@@ -60,9 +60,7 @@ def get_active_buses():
         if diff > 60:
             continue
         result.append(bus)
-
-    b p
-    p    return result
+        return result
 
 # ─── PASSENGER APIs ────────────────────────────────────────
 
@@ -115,8 +113,7 @@ def get_buses(request):
     return success({'buses': result, 'count': len(result)})
     vehicle_type = request.query_params.get('vehicle_type', None)
     if vehicle_type and bus.vehicle_type != vehicle_type:
-        continue
-         
+        continue         
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def get_bus_detail(request, bus_id):
