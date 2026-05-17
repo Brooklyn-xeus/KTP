@@ -1500,3 +1500,43 @@ def health_check(request):
         'status': 'healthy' if all_ok else 'degraded',
         'checks': checks,
     }, status=200 if all_ok else 503)
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def get_bus_detail(request, bus_id):
+    try:
+        bus = Bus.objects.select_related(
+            'location', 'route', 'driver'
+        ).get(id=bus_id, is_active=True)
+    except Bus.DoesNotExist:
+        return error('Bus not found', 404)
+
+    try:
+        loc = bus.location
+    except BusLocation.DoesNotExist:
+        return error('Location not available', 404)
+
+    stops = RouteStop.objects.filter(
+        route=bus.route
+    ).select_related('stop').order_by('order')
+
+    return success({
+        'bus_id': bus.id,
+        'plate': bus.plate_number,
+        'vehicle_type': bus.vehicle_type,
+        'icon': '🚌' if bus.vehicle_type == 'bus' else '🚐',
+        'route': bus.route.name,
+        'start': bus.route.start_point,
+        'end': bus.route.end_point,
+        'driver_name': bus.driver.name if bus.driver else 'Unknown',
+        'is_verified': bus.driver.is_approved if bus.driver else False,
+        'stops': [{
+            'id': rs.stop.id,
+            'name': rs.stop.name,
+            'lat': rs.stop.lat,
+            'lng': rs.stop.lng
+        } for rs in stops],
+        'lat': loc.lat,
+        'lng': loc.lng,
+        'last_updated': loc.last_updated.isoformat(),
+    })
