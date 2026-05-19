@@ -174,8 +174,8 @@ def search_buses(request):
     from_routes = RouteStop.objects.filter(stop=from_stop).values_list('route_id', 'order')
     to_routes = RouteStop.objects.filter(stop=to_stop).values_list('route_id', 'order')
 
-    from_dict = {r: o for r, o in from_routes}
-    to_dict = {r: o for r, o in to_routes}
+    from_dict = dict(from_routes)
+    to_dict = dict(to_routes)
 
     valid_routes = []
     for route_id in from_dict:
