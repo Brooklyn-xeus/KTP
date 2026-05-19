@@ -87,11 +87,11 @@ def log_otp_attempt(phone, ip, device, otp_entered, success_flag):
             success=success_flag,
         )
     except Exception as e:
-        logger.error(f"OTP log error: {e}")
+        logger.error("OTP log error: %s", e)
 
 def send_otp_sms(phone, otp):
     from decouple import config
-    logger.info(f"OTP requested for {phone}")
+    logger.info("OTP requested for %s", phone)
     api_key = config('FAST2SMS_API_KEY', default=None)
     if api_key:
         try:
@@ -107,9 +107,9 @@ def send_otp_sms(phone, otp):
                     "numbers": phone,
                 }
             )
-            logger.info(f"SMS response: {response.json()}")
+            logger.info("SMS response: %s", response.json())
         except Exception as e:
-            logger.error(f"SMS error: {e}")
+            logger.error("SMS error: %s", e)
             sentry_sdk.capture_exception(e)
     else:
         print(f"📱 OTP for {phone}: {otp}")
@@ -129,7 +129,7 @@ def google_login(request):
 
     # Rate limit by IP
     if not check_rate_limit(f'google_{ip}', max_attempts=10, window=3600):
-        logger.warning(f"[{request_id}] Google login rate limit: {ip}")
+        logger.warning("[%s] Google login rate limit: %s", request_id, ip)
         return rate_limit_error('Too many attempts. Try later.')
 
     try:
@@ -151,7 +151,7 @@ def google_login(request):
             return auth_error('Invalid Google token')
 
     except Exception as e:
-        logger.error(f"[{request_id}] Google verify error: {e}")
+        logger.error("[%s] Google verify error: %s", request_id, e)
         sentry_sdk.capture_exception(e)
         return server_error('Google verification failed')
 
@@ -166,7 +166,7 @@ def google_login(request):
         }
     )
 
-    logger.info(f"[{request_id}] Google login: {user.id} ({'new' if created else 'existing'})")
+    logger.info("[%s] Google login: %s (%s)", request_id, user.id, 'new' if created else 'existing')
 
     return success({
         'is_new': created,
@@ -239,7 +239,7 @@ def driver_register(request):
         return rate_limit_error(err)
 
     send_otp_sms(phone, otp)
-    logger.info(f"[{request_id}] Driver registered: {phone}")
+    logger.info("[%s] Driver registered: %s", request_id, phone)
 
     return success({
         'message': 'OTP sent. Verify your phone to complete registration.',
@@ -292,7 +292,7 @@ def driver_verify_otp(request):
                 return auth_error('Phone number mismatch')
 
         except Exception as e:
-            logger.error(f"[{request_id}] Firebase error: {e}")
+            logger.error("[%s] Firebase error: %s", request_id, e)
             return auth_error('Firebase verification failed')
 
     elif otp:
@@ -314,7 +314,7 @@ def driver_verify_otp(request):
         # NOT auto-approved — pending admin review
         user.save()
 
-        logger.info(f"[{request_id}] Driver OTP verified: {phone} — pending admin approval")
+        logger.info("[%s] Driver OTP verified: %s — pending admin approval", request_id, phone)
 
         # Auto create bus
         try:
@@ -370,7 +370,7 @@ def driver_login(request):
         return auth_error('Driver not found')
 
     if user.pin != pin:
-        logger.warning(f"[{request_id}] Wrong PIN: {phone}")
+        logger.warning("[%s] Wrong PIN: %s", request_id, phone)
         return auth_error('Wrong PIN')
 
     if not user.is_active:
@@ -391,7 +391,7 @@ def driver_login(request):
         user.fcm_token = fcm_token
         user.save()
 
-    logger.info(f"[{request_id}] Driver login: {phone}")
+    logger.info("[%s] Driver login: %s", request_id, phone)
 
     return success({
         'user': {
@@ -416,7 +416,7 @@ def logout(request):
             token_hash=token_hash
         ).update(is_revoked=True)
 
-    logger.info(f"User {request.user.id} logged out")
+    logger.info("User %s logged out", request.user.id)
     return success({'message': 'Logged out successfully'})
 
 @api_view(['POST'])
@@ -426,7 +426,7 @@ def logout_all_devices(request):
         user=request.user, is_revoked=False
     ).update(is_revoked=True)
 
-    logger.info(f"User {request.user.id} logged out all devices")
+    logger.info("User %s logged out all devices", request.user.id)
     return success({'message': 'Logged out from all devices'})
 
 # ─── RESEND OTP ────────────────────────────────────────────
@@ -504,7 +504,7 @@ def reset_pin(request):
     user.save()
 
     log_otp_attempt(phone, ip, '', otp, True)
-    logger.info(f"PIN reset: {phone}")
+    logger.info("PIN reset: %s", phone)
 
     return success({'message': 'PIN reset successfully'})
 
@@ -612,6 +612,6 @@ def driver_upload_selfie(request):
         return success({'message': 'Selfie uploaded', 'selfie_url': public_url})
 
     except Exception as e:
-        logger.error(f"Selfie upload error: {e}")
+        logger.error("Selfie upload error: %s", e)
         sentry_sdk.capture_exception(e)
         return server_error('Upload failed')
