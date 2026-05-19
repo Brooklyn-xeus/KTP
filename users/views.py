@@ -576,7 +576,7 @@ def driver_upload_selfie(request):
         buffer.seek(0)
 
         # Duplicate check
-        img_hash = hashlib.md5(buffer.getvalue()).hexdigest()
+        img_hash = hashlib.sha256(buffer.getvalue()).hexdigest()
         if User.objects.filter(selfie_hash=img_hash).exclude(id=user.id).exists():
             return error('Duplicate selfie detected')
 
