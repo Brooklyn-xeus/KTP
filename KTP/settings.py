@@ -149,6 +149,11 @@ CSRF_COOKIE_SECURE = not DEBUG
 # Whitenoise middleware already in list — add here if not:
 # 'whitenoise.middleware.WhiteNoiseMiddleware' after SecurityMiddleware
 # Production security
-
+# App Identity
+APP_NAME = "ITP"
+APP_FULL_NAME = "India Transport Platform"
+APP_TAGLINE = "India Transport Platform"
+APP_VERSION = "1.0.0"
+APP_PRIMARY_COLOR = "#2196F3"
 
 

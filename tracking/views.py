@@ -1473,10 +1473,12 @@ def admin_emergency_alerts(request):
 
 
 # ========== HEALTH CHECK ==========
+# ========== HEALTH CHECK ==========
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def health_check(request):
     import time
+    from django.conf import settings
     start = time.time()
     checks = {}
 
@@ -1498,9 +1500,12 @@ def health_check(request):
 
     return Response({
         'status': 'healthy' if all_ok else 'degraded',
+        'app': getattr(settings, 'APP_NAME', 'ITP'),
+        'version': getattr(settings, 'APP_VERSION', '1.0.0'),
         'checks': checks,
     }, status=200 if all_ok else 503)
 
+# ========== BUS DETAIL ==========
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def get_bus_detail(request, bus_id):
@@ -1526,17 +1531,21 @@ def get_bus_detail(request, bus_id):
         'vehicle_type': bus.vehicle_type,
         'icon': '🚌' if bus.vehicle_type == 'bus' else '🚐',
         'route': bus.route.name,
+        'route_id': bus.route.id,
         'start': bus.route.start_point,
         'end': bus.route.end_point,
         'driver_name': bus.driver.name if bus.driver else 'Unknown',
         'is_verified': bus.driver.is_approved if bus.driver else False,
+        'is_verified_blue_tick': bus.driver.docs_verified if bus.driver else False,
         'stops': [{
             'id': rs.stop.id,
             'name': rs.stop.name,
             'lat': rs.stop.lat,
-            'lng': rs.stop.lng
+            'lng': rs.stop.lng,
+            'order': rs.order,
         } for rs in stops],
         'lat': loc.lat,
         'lng': loc.lng,
+        'speed': loc.speed,
         'last_updated': loc.last_updated.isoformat(),
     })
