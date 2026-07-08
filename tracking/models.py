@@ -152,3 +152,147 @@ class StopArrival(models.Model):
 
     def __str__(self):
         return f"Trip {self.trip.id} arrived at {self.stop.name}"
+
+# ─── VEHICLE CONFIG ────────────────────────────────────────
+
+VEHICLE_CONFIG = {
+    'bus': {
+        'name': 'Bus',
+        'icon': '🚌',
+        'enabled': True,
+        'type': 'tracking',
+    },
+    'sonu': {
+        'name': 'Sonu/Sumo',
+        'icon': '🚐',
+        'enabled': True,
+        'type': 'tracking',
+    },
+    'erickshaw': {
+        'name': 'E-Rickshaw',
+        'icon': '🛺',
+        'enabled': False,
+        'type': 'booking',
+    },
+    'taxi': {
+        'name': 'Taxi',
+        'icon': '🚕',
+        'enabled': False,
+        'type': 'booking',
+    },
+    'bike': {
+        'name': 'Bike',
+        'icon': '🏍️',
+        'enabled': False,
+        'type': 'booking',
+    },
+}
+
+# Price per km
+VEHICLE_PRICING = {
+    'erickshaw': {'base': 20, 'per_km': 8},
+    'taxi':      {'base': 50, 'per_km': 14},
+    'bike':      {'base': 20, 'per_km': 7},
+}
+
+class RideRequest(models.Model):
+    STATUS = [
+        ('searching', 'Searching Driver'),
+        ('accepted', 'Driver Accepted'),
+        ('arrived', 'Driver Arrived'),
+        ('started', 'Ride Started'),
+        ('completed', 'Completed'),
+        ('cancelled', 'Cancelled'),
+        ('no_show', 'No Show'),
+    ]
+
+    PAYMENT_STATUS = [
+        ('pending', 'Pending'),
+        ('cash', 'Cash Paid'),
+        ('online', 'Online Paid'),
+    ]
+
+    passenger = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name='ride_requests'
+    )
+    driver = models.ForeignKey(
+        User, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='ride_assignments'
+    )
+    vehicle_type = models.CharField(max_length=20)
+
+    # Pickup
+    pickup_lat = models.FloatField()
+    pickup_lng = models.FloatField()
+    pickup_address = models.CharField(max_length=200, blank=True)
+
+    # Destination
+    dest_lat = models.FloatField()
+    dest_lng = models.FloatField()
+    dest_address = models.CharField(max_length=200, blank=True)
+
+    # Fare
+    distance_km = models.FloatField(default=0)
+    estimated_fare = models.FloatField(default=0)
+    final_fare = models.FloatField(null=True, blank=True)
+
+    # Status
+    status = models.CharField(max_length=20, choices=STATUS, default='searching')
+    payment_status = models.CharField(max_length=20, choices=PAYMENT_STATUS, default='pending')
+
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    arrived_at = models.DateTimeField(null=True, blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    # Cancellation
+    cancelled_by = models.CharField(max_length=20, blank=True)
+    cancel_reason = models.TextField(blank=True)
+    cancellation_fee = models.FloatField(default=0)
+
+    # No show
+    no_show_marked_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['passenger', 'status']),
+            models.Index(fields=['driver', 'status']),
+            models.Index(fields=['vehicle_type', 'status']),
+        ]
+
+    def __str__(self):
+        return f"Ride {self.id} — {self.vehicle_type} — {self.status}"
+
+class RideDriverOffer(models.Model):
+    """Track which drivers were notified and their response"""
+    ride = models.ForeignKey(RideRequest, on_delete=models.CASCADE, related_name='offers')
+    driver = models.ForeignKey(User, on_delete=models.CASCADE)
+    offered_at = models.DateTimeField(auto_now_add=True)
+    response = models.CharField(
+        max_length=20,
+        choices=[('pending', 'Pending'), ('accepted', 'Accepted'), ('rejected', 'Rejected'), ('timeout', 'Timeout')],
+        default='pending'
+    )
+    responded_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return f"Offer {self.id} — Driver {self.driver.name} — {self.response}"
+
+class NoShowLog(models.Model):
+    passenger = models.ForeignKey(User, on_delete=models.CASCADE, related_name='no_shows')
+    ride = models.ForeignKey(RideRequest, on_delete=models.CASCADE)
+    logged_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"NoShow — {self.passenger.name}"
+
+class UserViolation(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='violations')
+    violation_type = models.CharField(max_length=50)
+    detail = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.user.name} — {self.violation_type}"

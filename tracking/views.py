@@ -1549,3 +1549,585 @@ def get_bus_detail(request, bus_id):
         'speed': loc.speed,
         'last_updated': loc.last_updated.isoformat(),
     })
+
+from .models import (RideRequest, RideDriverOffer, 
+                     NoShowLog, UserViolation, 
+                     VEHICLE_CONFIG, VEHICLE_PRICING)
+
+# ─── VEHICLE CONFIG API ────────────────────────────────────
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def get_vehicle_config(request):
+    """Frontend ko batao kaunse vehicles enabled hain"""
+    return success({
+        'vehicles': [
+            {
+                'type': k,
+                'name': v['name'],
+                'icon': v['icon'],
+                'enabled': v['enabled'],
+                'mode': v['type'],
+                'pricing': VEHICLE_PRICING.get(k, None),
+            }
+            for k, v in VEHICLE_CONFIG.items()
+        ]
+    })
+
+# ─── FARE CALCULATION ──────────────────────────────────────
+
+def calculate_fare(vehicle_type, distance_km):
+    pricing = VEHICLE_PRICING.get(vehicle_type, {'base': 30, 'per_km': 10})
+    fare = pricing['base'] + (pricing['per_km'] * distance_km)
+    return round(fare, 2)
+
+def calculate_distance_km(lat1, lng1, lat2, lng2):
+    dist_m = calculate_distance(lat1, lng1, lat2, lng2)
+    return round(dist_m / 1000, 2)
+
+# ─── BOOK RIDE ─────────────────────────────────────────────
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def book_ride(request):
+    user = request.user
+
+    # Check suspended account
+    no_show_count = NoShowLog.objects.filter(passenger=user).count()
+    if no_show_count >= 5:
+        return error('Account suspended due to repeated no-shows. Contact support.', 403)
+
+    vehicle_type = request.data.get('vehicle_type', '').strip()
+    pickup_lat = request.data.get('pickup_lat')
+    pickup_lng = request.data.get('pickup_lng')
+    dest_lat = request.data.get('dest_lat')
+    dest_lng = request.data.get('dest_lng')
+    pickup_address = request.data.get('pickup_address', '')
+    dest_address = request.data.get('dest_address', '')
+
+    if not all([vehicle_type, pickup_lat, pickup_lng, dest_lat, dest_lng]):
+        return error('vehicle_type, pickup_lat, pickup_lng, dest_lat, dest_lng required')
+
+    # Check vehicle enabled
+    config = VEHICLE_CONFIG.get(vehicle_type)
+    if not config or not config['enabled']:
+        return error(f'{vehicle_type} is not available yet. Coming soon!', 400, 'COMING_SOON')
+
+    if config['type'] != 'booking':
+        return error('This vehicle type does not support booking', 400)
+
+    # Check active ride
+    active = RideRequest.objects.filter(
+        passenger=user,
+        status__in=['searching', 'accepted', 'arrived', 'started']
+    ).first()
+    if active:
+        return error('You already have an active ride', 400)
+
+    # Calculate fare
+    dist_km = calculate_distance_km(
+        float(pickup_lat), float(pickup_lng),
+        float(dest_lat), float(dest_lng)
+    )
+    fare = calculate_fare(vehicle_type, dist_km)
+
+    # Create ride request
+    ride = RideRequest.objects.create(
+        passenger=user,
+        vehicle_type=vehicle_type,
+        pickup_lat=float(pickup_lat),
+        pickup_lng=float(pickup_lng),
+        pickup_address=pickup_address,
+        dest_lat=float(dest_lat),
+        dest_lng=float(dest_lng),
+        dest_address=dest_address,
+        distance_km=dist_km,
+        estimated_fare=fare,
+        status='searching',
+    )
+
+    # Find nearest drivers (2km radius)
+    notify_nearby_drivers(ride)
+
+    return success({
+        'ride_id': ride.id,
+        'status': 'searching',
+        'estimated_fare': fare,
+        'distance_km': dist_km,
+        'vehicle_type': vehicle_type,
+        'icon': config['icon'],
+        'message': 'Looking for nearby drivers...',
+    })
+
+def notify_nearby_drivers(ride, radius_m=2000):
+    """Find nearby approved drivers and send FCM"""
+    from users.models import User as UserModel
+
+    # Get drivers with same vehicle type who are active
+    drivers = UserModel.objects.filter(
+        is_driver=True,
+        is_approved=True,
+        vehicle_type=ride.vehicle_type,
+        fcm_token__isnull=False,
+    ).exclude(
+        ride_assignments__status__in=['accepted', 'arrived', 'started']
+    )
+
+    notified = []
+    for driver in drivers:
+        # Check if driver has recent location
+        try:
+            bus = driver.bus
+            loc = bus.location
+            diff = (timezone.now() - loc.last_updated).total_seconds()
+            if diff > 300:  # 5 min se zyada purana
+                continue
+
+            dist = calculate_distance(
+                ride.pickup_lat, ride.pickup_lng,
+                loc.lat, loc.lng
+            )
+
+            if dist <= radius_m:
+                RideDriverOffer.objects.create(
+                    ride=ride,
+                    driver=driver,
+                )
+                notified.append(driver.fcm_token)
+
+        except Exception:
+            continue
+
+    # Send FCM
+    if notified:
+        try:
+            from .firebase import send_bulk_notification
+            send_bulk_notification(
+                tokens=notified,
+                title='🛺 New Ride Request!',
+                body=f'{ride.vehicle_type.title()} — {ride.pickup_address or "Nearby"} → {ride.dest_address or "Destination"}',
+                data={
+                    'ride_id': str(ride.id),
+                    'type': 'ride_request',
+                    'pickup_lat': str(ride.pickup_lat),
+                    'pickup_lng': str(ride.pickup_lng),
+                    'estimated_fare': str(ride.estimated_fare),
+                    'distance_km': str(ride.distance_km),
+                }
+            )
+        except Exception as e:
+            print(f"FCM error: {e}")
+
+    # If no drivers found after 60 sec — auto cancel
+    # (Frontend poll kare /v1/ride/{id}/status/)
+
+# ─── DRIVER ACCEPT/REJECT ──────────────────────────────────
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def respond_to_ride(request):
+    user = request.user
+    if not user.is_driver:
+        return error('Not a driver')
+
+    ride_id = request.data.get('ride_id')
+    action = request.data.get('action')  # accept / reject
+
+    if action not in ['accept', 'reject']:
+        return error('action must be accept or reject')
+
+    try:
+        ride = RideRequest.objects.get(id=ride_id, status='searching')
+    except RideRequest.DoesNotExist:
+        return error('Ride not available or already taken', 404)
+
+    try:
+        offer = RideDriverOffer.objects.get(ride=ride, driver=user)
+    except RideDriverOffer.DoesNotExist:
+        return error('You were not offered this ride', 403)
+
+    if action == 'reject':
+        offer.response = 'rejected'
+        offer.responded_at = timezone.now()
+        offer.save()
+        return success({'message': 'Ride rejected'})
+
+    # Accept
+    if RideRequest.objects.filter(
+        driver=user,
+        status__in=['accepted', 'arrived', 'started']
+    ).exists():
+        return error('You already have an active ride')
+
+    ride.driver = user
+    ride.status = 'accepted'
+    ride.accepted_at = timezone.now()
+    ride.save()
+
+    offer.response = 'accepted'
+    offer.responded_at = timezone.now()
+    offer.save()
+
+    # Notify passenger
+    if ride.passenger.fcm_token:
+        try:
+            from .firebase import send_bulk_notification
+            send_bulk_notification(
+                tokens=[ride.passenger.fcm_token],
+                title='🎉 Driver Found!',
+                body=f'{user.name} is on the way!',
+                data={
+                    'ride_id': str(ride.id),
+                    'type': 'driver_accepted',
+                    'driver_name': user.name,
+                    'driver_phone': user.phone,
+                }
+            )
+        except Exception as e:
+            print(f"FCM error: {e}")
+
+    return success({
+        'message': 'Ride accepted',
+        'ride_id': ride.id,
+        'passenger_name': ride.passenger.name,
+        'pickup_lat': ride.pickup_lat,
+        'pickup_lng': ride.pickup_lng,
+        'pickup_address': ride.pickup_address,
+        'dest_lat': ride.dest_lat,
+        'dest_lng': ride.dest_lng,
+        'estimated_fare': ride.estimated_fare,
+    })
+
+# ─── DRIVER ARRIVED ────────────────────────────────────────
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def driver_arrived(request):
+    user = request.user
+    ride_id = request.data.get('ride_id')
+
+    try:
+        ride = RideRequest.objects.get(id=ride_id, driver=user, status='accepted')
+    except RideRequest.DoesNotExist:
+        return error('Ride not found', 404)
+
+    ride.status = 'arrived'
+    ride.arrived_at = timezone.now()
+    ride.save()
+
+    # Notify passenger
+    if ride.passenger.fcm_token:
+        try:
+            from .firebase import send_bulk_notification
+            send_bulk_notification(
+                tokens=[ride.passenger.fcm_token],
+                title='🚗 Driver has arrived!',
+                body='Your driver is waiting. Please hurry!',
+                data={'ride_id': str(ride.id), 'type': 'driver_arrived'}
+            )
+        except Exception:
+            pass
+
+    return success({
+        'message': 'Marked as arrived',
+        'arrived_at': ride.arrived_at.isoformat(),
+        'wait_free_minutes': 2,
+    })
+
+# ─── START RIDE ────────────────────────────────────────────
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def start_ride(request):
+    user = request.user
+    ride_id = request.data.get('ride_id')
+
+    try:
+        ride = RideRequest.objects.get(
+            id=ride_id, driver=user,
+            status__in=['accepted', 'arrived']
+        )
+    except RideRequest.DoesNotExist:
+        return error('Ride not found', 404)
+
+    ride.status = 'started'
+    ride.started_at = timezone.now()
+    ride.save()
+
+    return success({'message': 'Ride started', 'started_at': ride.started_at.isoformat()})
+
+# ─── COMPLETE RIDE ─────────────────────────────────────────
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def complete_ride(request):
+    user = request.user
+    ride_id = request.data.get('ride_id')
+    payment_method = request.data.get('payment_method', 'cash')
+
+    try:
+        ride = RideRequest.objects.get(id=ride_id, driver=user, status='started')
+    except RideRequest.DoesNotExist:
+        return error('Ride not found', 404)
+
+    ride.status = 'completed'
+    ride.completed_at = timezone.now()
+    ride.final_fare = ride.estimated_fare
+    ride.payment_status = 'cash' if payment_method == 'cash' else 'pending'
+    ride.save()
+
+    # Notify passenger
+    if ride.passenger.fcm_token:
+        try:
+            from .firebase import send_bulk_notification
+            send_bulk_notification(
+                tokens=[ride.passenger.fcm_token],
+                title='✅ Ride Completed!',
+                body=f'Total fare: ₹{ride.final_fare}',
+                data={'ride_id': str(ride.id), 'type': 'ride_completed'}
+            )
+        except Exception:
+            pass
+
+    return success({
+        'message': 'Ride completed',
+        'final_fare': ride.final_fare,
+        'distance_km': ride.distance_km,
+        'payment_status': ride.payment_status,
+    })
+
+# ─── CANCEL RIDE ───────────────────────────────────────────
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def cancel_ride(request):
+    user = request.user
+    ride_id = request.data.get('ride_id')
+    reason = request.data.get('reason', '')
+
+    try:
+        ride = RideRequest.objects.get(
+            id=ride_id,
+            status__in=['searching', 'accepted', 'arrived']
+        )
+    except RideRequest.DoesNotExist:
+        return error('Ride not found', 404)
+
+    # Check who is cancelling
+    if ride.passenger == user:
+        cancelled_by = 'passenger'
+    elif ride.driver == user:
+        cancelled_by = 'driver'
+    else:
+        return error('Not authorized', 403)
+
+    # Cancellation fee logic
+    cancellation_fee = 0
+    if cancelled_by == 'passenger' and ride.accepted_at:
+        elapsed = (timezone.now() - ride.accepted_at).total_seconds()
+        if elapsed > 120:  # 2 min ke baad
+            cancellation_fee = 20  # ₹20 fee
+
+    ride.status = 'cancelled'
+    ride.cancelled_by = cancelled_by
+    ride.cancel_reason = reason
+    ride.cancellation_fee = cancellation_fee
+    ride.save()
+
+    # Log violation if passenger cancels repeatedly
+    if cancelled_by == 'passenger' and cancellation_fee > 0:
+        UserViolation.objects.create(
+            user=user,
+            violation_type='late_cancellation',
+            detail=f'Ride {ride.id} cancelled after 2 min'
+        )
+
+    return success({
+        'message': 'Ride cancelled',
+        'cancellation_fee': cancellation_fee,
+        'fee_note': '₹20 cancellation fee applied' if cancellation_fee > 0 else 'No cancellation fee',
+    })
+
+# ─── NO SHOW ───────────────────────────────────────────────
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def mark_no_show(request):
+    user = request.user
+    if not user.is_driver:
+        return error('Not a driver')
+
+    ride_id = request.data.get('ride_id')
+
+    try:
+        ride = RideRequest.objects.get(id=ride_id, driver=user, status='arrived')
+    except RideRequest.DoesNotExist:
+        return error('Ride not found', 404)
+
+    # Check 3 min wait
+    if ride.arrived_at:
+        elapsed = (timezone.now() - ride.arrived_at).total_seconds()
+        if elapsed < 180:  # 3 min wait required
+            remaining = int((180 - elapsed) / 60)
+            return error(f'Please wait {remaining} more minutes before marking no-show')
+
+    ride.status = 'no_show'
+    ride.no_show_marked_at = timezone.now()
+    ride.cancellation_fee = 30  # ₹30 no-show fee
+    ride.save()
+
+    # Log no show
+    no_show = NoShowLog.objects.create(
+        passenger=ride.passenger,
+        ride=ride,
+    )
+
+    # Check suspension
+    total_no_shows = NoShowLog.objects.filter(passenger=ride.passenger).count()
+    suspended = total_no_shows >= 5
+
+    if suspended:
+        UserViolation.objects.create(
+            user=ride.passenger,
+            violation_type='account_suspended',
+            detail=f'5 no-shows reached'
+        )
+
+    # Notify passenger
+    if ride.passenger.fcm_token:
+        try:
+            from .firebase import send_bulk_notification
+            msg = 'Account suspended due to repeated no-shows.' if suspended else f'No-show recorded. ₹30 fee applied. ({total_no_shows}/5)'
+            send_bulk_notification(
+                tokens=[ride.passenger.fcm_token],
+                title='⚠️ No-Show Recorded',
+                body=msg,
+                data={'type': 'no_show', 'ride_id': str(ride.id)}
+            )
+        except Exception:
+            pass
+
+    return success({
+        'message': 'No-show recorded',
+        'no_show_fee': 30,
+        'total_no_shows': total_no_shows,
+        'account_suspended': suspended,
+    })
+
+# ─── RIDE STATUS POLL ──────────────────────────────────────
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_ride_status(request, ride_id):
+    try:
+        ride = RideRequest.objects.get(id=ride_id)
+    except RideRequest.DoesNotExist:
+        return error('Ride not found', 404)
+
+    if ride.passenger != request.user and ride.driver != request.user:
+        return error('Not authorized', 403)
+
+    data = {
+        'ride_id': ride.id,
+        'status': ride.status,
+        'vehicle_type': ride.vehicle_type,
+        'estimated_fare': ride.estimated_fare,
+        'final_fare': ride.final_fare,
+        'distance_km': ride.distance_km,
+        'pickup_lat': ride.pickup_lat,
+        'pickup_lng': ride.pickup_lng,
+        'dest_lat': ride.dest_lat,
+        'dest_lng': ride.dest_lng,
+        'cancellation_fee': ride.cancellation_fee,
+    }
+
+    if ride.driver:
+        data['driver'] = {
+            'name': ride.driver.name,
+            'phone': ride.driver.phone,
+            'vehicle_type': ride.driver.vehicle_type,
+            'bus_number': ride.driver.bus_number,
+        }
+
+    return success(data)
+
+# ─── MY RIDES (PASSENGER) ──────────────────────────────────
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def my_rides(request):
+    rides = RideRequest.objects.filter(
+        passenger=request.user
+    ).order_by('-created_at')[:20]
+
+    return success({
+        'rides': [{
+            'ride_id': r.id,
+            'vehicle_type': r.vehicle_type,
+            'status': r.status,
+            'pickup_address': r.pickup_address,
+            'dest_address': r.dest_address,
+            'estimated_fare': r.estimated_fare,
+            'final_fare': r.final_fare,
+            'date': r.created_at.strftime('%Y-%m-%d %H:%M'),
+        } for r in rides]
+    })
+
+# ─── DRIVER RIDE HISTORY ───────────────────────────────────
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def driver_rides(request):
+    if not request.user.is_driver:
+        return error('Not a driver')
+
+    rides = RideRequest.objects.filter(
+        driver=request.user
+    ).order_by('-created_at')[:20]
+
+    return success({
+        'rides': [{
+            'ride_id': r.id,
+            'vehicle_type': r.vehicle_type,
+            'status': r.status,
+            'pickup_address': r.pickup_address,
+            'dest_address': r.dest_address,
+            'final_fare': r.final_fare,
+            'date': r.created_at.strftime('%Y-%m-%d %H:%M'),
+        } for r in rides]
+    })
+
+# ─── ESTIMATE FARE (before booking) ───────────────────────
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def estimate_fare(request):
+    vehicle_type = request.data.get('vehicle_type')
+    pickup_lat = request.data.get('pickup_lat')
+    pickup_lng = request.data.get('pickup_lng')
+    dest_lat = request.data.get('dest_lat')
+    dest_lng = request.data.get('dest_lng')
+
+    if not all([vehicle_type, pickup_lat, pickup_lng, dest_lat, dest_lng]):
+        return error('All fields required')
+
+    config = VEHICLE_CONFIG.get(vehicle_type)
+    if not config:
+        return error('Invalid vehicle type')
+
+    dist_km = calculate_distance_km(
+        float(pickup_lat), float(pickup_lng),
+        float(dest_lat), float(dest_lng)
+    )
+    fare = calculate_fare(vehicle_type, dist_km)
+    pricing = VEHICLE_PRICING.get(vehicle_type, {})
+
+    return success({
+        'vehicle_type': vehicle_type,
+        'icon': config['icon'],
+        'distance_km': dist_km,
+        'estimated_fare': fare,
+        'base_fare': pricing.get('base', 0),
+        'per_km': pricing.get('per_km', 0),
+        'breakdown': f"₹{pricing.get('base', 0)} base + ₹{pricing.get('per_km', 0)}/km × {dist_km}km",
+    })

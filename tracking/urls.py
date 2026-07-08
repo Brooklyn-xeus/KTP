@@ -71,4 +71,19 @@ path('admin/verify-driver/', views.admin_verify_driver),
 path('admin/trips/', views.admin_active_trips),
 path('admin/emergencies/', views.admin_emergency_alerts),
 path('health/', views.health_check),
+# Vehicle config
+path('vehicles/', views.get_vehicle_config),
+
+# Booking
+path('ride/estimate/', views.estimate_fare),
+path('ride/book/', views.book_ride),
+path('ride/respond/', views.respond_to_ride),
+path('ride/arrived/', views.driver_arrived),
+path('ride/start/', views.start_ride),
+path('ride/complete/', views.complete_ride),
+path('ride/cancel/', views.cancel_ride),
+path('ride/no-show/', views.mark_no_show),
+path('ride/<int:ride_id>/status/', views.get_ride_status),
+path('ride/my/', views.my_rides),
+path('ride/driver/history/', views.driver_rides),
 ]

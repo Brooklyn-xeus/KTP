@@ -48,3 +48,21 @@ class StopArrivalAdmin(admin.ModelAdmin):
     readonly_fields = ['arrival_time']
 
 admin.site.register(PassengerCountLog)
+from .models import RideRequest, RideDriverOffer, NoShowLog, UserViolation
+
+@admin.register(RideRequest)
+class RideRequestAdmin(admin.ModelAdmin):
+    list_display = ['id', 'passenger', 'driver', 'vehicle_type', 'status', 'estimated_fare', 'created_at']
+    list_filter = ['status', 'vehicle_type', 'payment_status']
+    search_fields = ['passenger__name', 'driver__name']
+    readonly_fields = ['created_at', 'accepted_at', 'arrived_at', 'started_at', 'completed_at']
+
+@admin.register(NoShowLog)
+class NoShowAdmin(admin.ModelAdmin):
+    list_display = ['passenger', 'ride', 'logged_at']
+
+@admin.register(UserViolation)
+class ViolationAdmin(admin.ModelAdmin):
+    list_display = ['user', 'violation_type', 'created_at']
+
+admin.site.register(RideDriverOffer)
